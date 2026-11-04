@@ -78,6 +78,18 @@
 | F3 | 12건 실행과 결과 기록 | `evaluation/` | 12건을 1회씩 실행해 자동 점검·PM 체크리스트 결과 기록 | 60m | E3, F1, F2 |
 | F4 | 실패 건 수정과 재평가 (여유 시간) | 해당 파일 | 12/12 통과 (PRD 합격선) | 60m | F3 |
 
+## 6-2. Guardrail (G) — DESIGN 16절
+
+규칙 함수는 `src/tools.py`, 연결은 `src/api.py`, 테스트는 `tests/test_api.py` 에 둡니다. 새 파일은 만들지 않습니다.
+
+| ID | 작업 | 파일 | 완료 기준 | 예상 | 선행 |
+|---|---|---|---|---|---|
+| G1 | `classify_request`: 비밀 값·개인정보·실시간 조회 거절 규칙 | `src/tools.py`, `tests/test_api.py` | TQ-06·07·11·12 입력이 각각 `unsupported_lookup`, `secret_request`, `personal_data_request` 로 분류됨. 일반 여행 요청은 통과 | 45m | D4 |
+| G2 | 필수 정보 누락 검사와 `known_trip` 병합 | `src/tools.py`, `tests/test_api.py` | 여행지·기간·예산 중 빠진 항목 목록을 반환. 이전 값과 새 입력을 합침 | 45m | G1 |
+| G3 | 조건 충돌 감지 규칙 | `src/tools.py`, `tests/test_api.py` | TQ-10 입력에서 충돌을 감지. 충돌이 없는 입력은 오탐하지 않음 | 30m | G1 |
+| G4 | `/query` 에 Guardrail 연결: 422 코드, `known_trip` 서버 메모리, `session_id` 이어가기, 충돌 안내 | `src/api.py`, `tests/test_api.py` | 거절·누락은 `{"error": {"code", "message", ...}}` 422. 누락 응답에 `session_id`, `missing` 포함. 같은 `session_id` 로 보완 입력 시 그래프 시작. 충돌은 200 + 안내 | 60m | G2, G3 |
+| G5 | 여행지 파서 보정과 TQ-06~12 점검 테스트 | `src/api.py`, `tests/test_api.py` | '정확한' 등 수식어를 장소로 읽지 않음. 16절 대응표의 6개 시나리오가 기대한 코드·상태로 응답 | 45m | G4 |
+
 ## 7. 의존 순서 요약
 
 ```
@@ -105,7 +117,8 @@ A2 ─ C2 ─┘                │
 | API (D) | 4 | 3시간 15분 |
 | UI (E) | 3 | 2시간 15분 |
 | 평가 (F) | 4 | 3시간 45분 |
-| **합계** | **37** | **약 28시간 15분** |
+| Guardrail (G) | 5 | 3시간 45분 |
+| **합계** | **42** | **약 32시간** |
 
 ## 9. 사용자 확인이 필요한 항목
 
