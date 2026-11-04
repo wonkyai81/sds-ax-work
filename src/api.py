@@ -10,9 +10,10 @@ from langgraph.types import Command
 from pydantic import BaseModel
 
 from src.agent import PLAN_TYPES, build_answer, build_graph
+from src.tools import CONFLICT_NOTICE, classify_request, has_conflict, merge_trip
 
 DONE_WORDS = {"종료", "끝", "그만", "완료", "done", "끝내기", "종료할게", "끝낼게"}
-_STOPWORDS = {"예산", "여행", "계획", "일정", "총", "약", "으로", "로"}
+_STOPWORDS = {"예산", "여행", "계획", "일정", "총", "약", "으로", "로", "정확한", "정확", "실시간", "최저가", "대략"}
 
 
 class QueryRequest(BaseModel):
@@ -25,13 +26,13 @@ class QueryRequest(BaseModel):
 class ApiError(Exception):
     """HTTP 오류로 바꿀 API 오류 (code, message, status)."""
 
-    def __init__(self, status: int, code: str, message: str):
-        self.status, self.code, self.message = status, code, message
+    def __init__(self, status: int, code: str, message: str, extra: dict | None = None):
+        self.status, self.code, self.message, self.extra = status, code, message, extra or {}
 
 
-def error_response(status: int, code: str, message: str) -> JSONResponse:
-    """{"error": {"code", "message"}} 형식의 오류 응답을 만든다."""
-    return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
+def error_response(status: int, code: str, message: str, extra: dict | None = None) -> JSONResponse:
+    """{"error": {"code", "message"}} 형식의 오류 응답을 만든다. extra 는 error 안에 덧붙인다(예: session_id, missing)."""
+    return JSONResponse(status_code=status, content={"error": {"code": code, "message": message, **(extra or {})}})
 
 
 def parse_trip(question: str) -> dict:
@@ -86,6 +87,7 @@ def create_app(graph: Any | None = None) -> FastAPI:
     """FastAPI 앱을 만든다. graph 를 주면 그 그래프를 쓰고, 없으면 첫 요청에서 만든다."""
     app = FastAPI(title="여행 일정 에이전트")
     holder: dict = {"graph": graph}
+    known_trips: dict[str, dict] = {}  # 정보 부족으로 이어가는 세션의 파싱값(서버 메모리, 그래프 시작 전)
 
     def get_graph():
         """그래프(체크포인터 포함)를 한 번만 만들어 재사용한다."""
@@ -101,7 +103,7 @@ def create_app(graph: Any | None = None) -> FastAPI:
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError):
         """API 오류를 지정한 상태 코드로 돌려준다."""
-        return error_response(exc.status, exc.code, exc.message)
+        return error_response(exc.status, exc.code, exc.message, exc.extra)
 
     @app.exception_handler(Exception)
     async def _unexpected(request: Request, exc: Exception):
@@ -115,9 +117,22 @@ def create_app(graph: Any | None = None) -> FastAPI:
         if not question:
             raise ApiError(422, "empty_question", "question 이 비어 있습니다")
         g = get_graph()
-        if body.session_id is None:
-            session_id = f"sess_{uuid.uuid4().hex}"
-            trip = parse_trip(question)
+        new_trip = body.session_id is None or body.session_id in known_trips
+        trip = None
+        if new_trip:
+            trip = merge_trip(known_trips.get(body.session_id), parse_trip(question))
+        verdict = classify_request(question, trip, new_trip)
+        if verdict:
+            extra = {}
+            if verdict["code"] == "missing_fields":
+                session_id = body.session_id or f"sess_{uuid.uuid4().hex}"
+                known_trips[session_id] = trip
+                extra = {"session_id": session_id, "missing": verdict["missing"]}
+            raise ApiError(422, verdict["code"], verdict["message"], extra)
+        notice = CONFLICT_NOTICE if new_trip and has_conflict(question) else ""
+        if new_trip:
+            session_id = body.session_id or f"sess_{uuid.uuid4().hex}"
+            known_trips.pop(session_id, None)
             config = {"configurable": {"thread_id": session_id}}
             g.invoke({"trip": trip}, config)
         else:
@@ -140,7 +155,10 @@ def create_app(graph: Any | None = None) -> FastAPI:
             else:
                 raise ApiError(404, "session_closed", "종료되었거나 대기 중이 아닌 세션입니다")
             g.invoke(Command(resume=resume), config)
-        return _build_response(g, config, session_id)
+        response = _build_response(g, config, session_id)
+        if notice:
+            response["answer"]["plainAnswer"] = f"{notice}\n{response['answer']['plainAnswer']}"
+        return response
 
     return app
 

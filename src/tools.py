@@ -1,4 +1,5 @@
 """도메인 타입과 결정적 도구: 합계·예산 판정·가장 근접한 안 선택·텍스트/HTML 렌더링 (LLM 호출 없음)."""
+import re
 from html import escape
 from typing import Literal, TypedDict
 
@@ -83,6 +84,65 @@ def final_items(plan_type: str, attempts: list[list[ItineraryItem]], budget_krw:
         if check_budget(plan_type, attempt, budget_krw)["within"]:
             return attempt
     return closest_attempt(attempts, plan_type, budget_krw)
+
+
+_SECRET_RE = re.compile(
+    r"시스템\s*프롬프트|api\s*키|api\s*key|aws|bedrock|환경\s*변수|비밀\s*번호|자격\s*증명|시크릿|secret|토큰|\.env",
+    re.IGNORECASE,
+)
+_PERSONAL_RE = re.compile(r"다른\s*(?:사용자|사람|유저)|그\s*사람|저장해\s*둔|연락처|전화\s*번호|이메일\s*주소|개인\s*정보")
+_LOOKUP_RE = re.compile(r"실시간|최저가|정확한\s*[\w\s]{0,10}?(?:요금|가격|금액|비용)|예약")
+_LUXURY_RE = re.compile(r"최고급|5\s*성급|오성급|럭셔리|초호화")
+_CHEAP_RE = re.compile(r"최소|최저|저렴|가장\s*싸|아주\s*싸")
+TRIP_FIELD_LABELS = {"destination": "여행지", "days": "기간", "budget_krw": "예산"}
+CONFLICT_NOTICE = "안내: 요청하신 조건(최고급·5성급과 최소 비용)이 서로 충돌해 예산을 우선해 안을 만들었습니다."
+
+_GUARD_MESSAGES = {
+    "secret_request": "시스템 설정, 프롬프트, API 키 같은 비밀 값은 알려드릴 수 없습니다. 여행지·기간·예산을 알려 주시면 일정을 만들어 드립니다.",
+    "personal_data_request": "다른 사용자의 계획이나 개인정보는 제공할 수 없습니다. 이 서비스는 로그인과 저장 기능이 없어 사용자별 정보를 보관하지 않습니다.",
+    "unsupported_lookup": "v1은 실시간 가격이나 특정 업체의 정확한 요금을 조회하지 않고 AI 추정값만 씁니다. 여행지·기간·예산을 알려 주시면 추정 비용으로 일정을 만들어 드립니다.",
+}
+
+
+def missing_fields(trip: dict) -> list[str]:
+    """여행 요청에서 빠진 항목(여행지·기간·예산)의 한글 이름 목록을 돌려준다."""
+    return [label for key, label in TRIP_FIELD_LABELS.items() if not trip.get(key)]
+
+
+def merge_trip(known: dict | None, parsed: dict) -> dict:
+    """보관해 둔 값(known)에 새로 파싱한 값을 덮어 합친다. 새 값이 비어 있으면 기존 값을 유지한다."""
+    merged = dict(known or {})
+    for key in TRIP_FIELD_LABELS:
+        if parsed.get(key):
+            merged[key] = parsed[key]
+        else:
+            merged.setdefault(key, parsed.get(key))
+    return merged
+
+
+def has_conflict(question: str) -> bool:
+    """최고급 조건과 최소 비용 조건이 함께 나오면 충돌로 본다."""
+    return bool(_LUXURY_RE.search(question) and _CHEAP_RE.search(question))
+
+
+def classify_request(question: str, known_trip: dict | None = None, new_trip: bool = False) -> dict | None:
+    """요청을 규칙으로 검사한다(LLM 미사용). 거절·안내가 필요하면 {code, message[, missing]}, 통과면 None.
+
+    1~2번(비밀·개인정보)은 모든 요청에, 3~4번(실시간 조회·필수 정보 부족)은 new_trip=True 일 때만 적용한다.
+    known_trip 은 파싱·병합이 끝난 여행 정보다.
+    """
+    for code, pattern in (("secret_request", _SECRET_RE), ("personal_data_request", _PERSONAL_RE)):
+        if pattern.search(question):
+            return {"code": code, "message": _GUARD_MESSAGES[code]}
+    if not new_trip:
+        return None
+    if _LOOKUP_RE.search(question):
+        return {"code": "unsupported_lookup", "message": _GUARD_MESSAGES["unsupported_lookup"]}
+    missing = missing_fields(known_trip or {})
+    if missing:
+        names = "·".join(missing)
+        return {"code": "missing_fields", "missing": missing, "message": f"{names}을(를) 알려 주세요. 알려 주시면 이어서 일정을 만들겠습니다."}
+    return None
 
 
 def _won(value: int) -> str:
