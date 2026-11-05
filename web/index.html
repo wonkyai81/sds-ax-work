@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>여행 일정 에이전트</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+<header class="border-b border-slate-200 bg-white">
+  <div class="mx-auto max-w-4xl px-6 py-4 flex items-center justify-between">
+    <h1 class="text-lg font-semibold tracking-tight">✈️ 여행 일정 에이전트</h1>
+    <button id="reset" class="text-sm text-slate-500 hover:text-slate-800">새로 시작</button>
+  </div>
+</header>
+
+<main class="mx-auto max-w-4xl px-6 py-8 space-y-6">
+  <!-- 자연어 요청 입력 -->
+  <section class="rounded-2xl bg-white shadow-sm border border-slate-200 p-5">
+    <label for="prompt" id="promptLabel" class="block text-sm font-medium text-slate-600 mb-2">어디로, 며칠, 몇 명이 가시나요? (출발지·예산은 생략할 수 있어요)</label>
+    <textarea id="prompt" rows="2" class="w-full resize-none rounded-xl border border-slate-300 p-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+      placeholder="예) 부산에서 도쿄로 3박 4일 2명, 예산 100만원 (출발지를 생략하면 서울, 예산은 생략 가능)"></textarea>
+    <p id="dateGuide" class="mt-2 text-xs text-slate-500">여행 기간(날짜)을 명시하지 않을 경우 D+30일을 기본으로 조회합니다. 날짜를 쓰면 그 날짜로 조회합니다. 예) 12월 20일부터 23일까지</p>
+    <div class="mt-3 flex items-center justify-between">
+      <span class="text-xs text-slate-400">Enter 전송 · Shift+Enter 줄바꿈</span>
+      <button id="send" class="rounded-xl bg-indigo-600 px-5 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50">보내기</button>
+    </div>
+  </section>
+
+  <!-- 처리 진행 상태 -->
+  <section id="progress" class="hidden rounded-2xl bg-white shadow-sm border border-slate-200 p-5">
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-2 text-sm font-medium">
+        <span id="spinner" class="inline-block h-4 w-4 rounded-full border-2 border-indigo-500 border-t-transparent animate-spin"></span>
+        <span id="progressTitle">처리 중…</span>
+      </div>
+      <span id="elapsed" class="text-xs text-slate-400 tabular-nums">0초</span>
+    </div>
+    <div class="mt-3 h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
+      <div id="bar" class="h-full w-0 bg-indigo-500 transition-all duration-500"></div>
+    </div>
+    <ul id="steps" class="mt-3 space-y-1 text-sm text-slate-600"></ul>
+  </section>
+
+  <!-- 안내/오류 -->
+  <div id="notice" class="hidden rounded-xl border px-4 py-3 text-sm whitespace-pre-line"></div>
+
+  <!-- 3안 -->
+  <section id="plans" class="hidden">
+    <h2 class="mb-3 text-sm font-semibold text-slate-600">추천 3안 — 하나를 골라 주세요</h2>
+    <div id="planCards" class="grid gap-3 sm:grid-cols-3"></div>
+  </section>
+
+  <!-- 리포트 -->
+  <section id="report" class="hidden rounded-2xl bg-white shadow-sm border border-slate-200 p-5">
+    <div id="reportText" class="mb-3 text-sm text-slate-600 whitespace-pre-line"></div>
+    <iframe id="reportFrame" title="여행 리포트" sandbox="" class="w-full rounded-xl border border-slate-200 bg-white" style="min-height:520px"></iframe>
+  </section>
+</main>
+
+<script>
+const API = location.origin;
+const LABELS = {
+  validate_request: "요청 내용 확인",
+  generate_plan: "일정 생성",
+  check_budget: "예산 검사",
+  readjust_plan: "예산 초과 안 재조정",
+  pick_closest: "가장 근접한 안 선택",
+  collect_plans: "3안 정리",
+  await_selection: "선택 대기",
+  generate_guide: "맛집·명소 가이드와 유의 사항 생성",
+  render_answer: "리포트 작성",
+  await_chat: "수정 요청 대기",
+  chat_edit: "요청하신 부분 수정",
+  check_budget_selected: "수정 후 예산 검사",
+  readjust_selected: "수정 후 예산 재조정",
+};
+// 한 요청에서 지나가는 대표 단계 수(진행률 막대 추정용)
+const EXPECTED = { plans: 6, select: 3, chat: 4 };
+
+const $ = (id) => document.getElementById(id);
+let state = { sessionId: null, stage: "new" }; // stage: new | select | chat | done
+let timer = null;
+
+function setStage(stage) {
+  state.stage = stage;
+  const cfg = {
+    new: ["어디로, 며칠, 몇 명이 가시나요? (출발지·예산은 생략할 수 있어요)", "예) 부산에서 도쿄로 3박 4일 2명, 예산 100만원 (출발지를 생략하면 서울, 예산은 생략 가능)"],
+    select: ["마음에 드는 안을 말씀해 주세요.", "예) 2번 안으로 할게 / 가성비형으로 할게"],
+    chat: ["고치고 싶은 부분을 말씀해 주세요.", "예) 2일차 저녁을 고급 스시 오마카세로 바꿔줘 (끝내려면 '종료')"],
+    done: ["대화가 끝났습니다. 새로 시작하려면 위의 '새로 시작'을 누르세요.", ""],
+  }[stage];
+  $("promptLabel").textContent = cfg[0];
+  $("prompt").placeholder = cfg[1];
+  $("prompt").disabled = $("send").disabled = stage === "done";
+}
+
+function showNotice(text, kind) {
+  const el = $("notice");
+  el.textContent = text;
+  el.className = "rounded-xl border px-4 py-3 text-sm whitespace-pre-line " +
+    (kind === "error" ? "border-rose-200 bg-rose-50 text-rose-700" : "border-amber-200 bg-amber-50 text-amber-800");
+  el.classList.toggle("hidden", !text);
+}
+
+function startProgress(kind) {
+  $("progress").classList.remove("hidden");
+  $("spinner").classList.remove("hidden");
+  $("progressTitle").textContent = "처리 중…";
+  $("steps").innerHTML = "";
+  $("bar").style.width = "4%";
+  const t0 = Date.now();
+  $("elapsed").textContent = "0초";
+  clearInterval(timer);
+  timer = setInterval(() => { $("elapsed").textContent = Math.round((Date.now() - t0) / 1000) + "초"; }, 500);
+  return { kind, done: 0, genCount: 0 };
+}
+
+function addStep(p, node) {
+  p.done += 1;
+  let label = LABELS[node] || node;
+  if (node === "generate_plan") { p.genCount += 1; label += ` (${p.genCount}/3)`; }
+  const li = document.createElement("li");
+  li.textContent = "✓ " + label;
+  $("steps").appendChild(li);
+  $("bar").style.width = Math.min(92, (p.done / (EXPECTED[p.kind] || 5)) * 100) + "%";
+  $("progressTitle").textContent = label + " 완료 — 다음 단계 처리 중…";
+}
+
+function endProgress(ok) {
+  clearInterval(timer);
+  $("spinner").classList.add("hidden");
+  $("bar").style.width = ok ? "100%" : "0%";
+  $("progressTitle").textContent = ok ? "처리 완료" : "처리 실패";
+}
+
+async function send(text) {
+  text = (text || $("prompt").value).trim();
+  if (!text) return;
+  $("send").disabled = true;
+  showNotice("");
+  const kind = state.stage === "new" ? "plans" : state.stage === "select" ? "select" : "chat";
+  const p = startProgress(kind);
+  const body = { question: text };
+  if (state.sessionId) body.session_id = state.sessionId;
+  try {
+    const resp = await fetch(API + "/query/stream", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "", final = null;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.step) addStep(p, ev.step); else final = ev;
+      }
+    }
+    if (!final) throw new Error("응답이 중간에 끊겼습니다");
+    if (final.error) {
+      endProgress(false);
+      if (final.error.session_id) { state.sessionId = final.error.session_id; } // 정보 부족: 같은 세션으로 이어감
+      showNotice(final.error.message, final.error.code === "missing_fields" ? "notice" : "error");
+    } else {
+      endProgress(true);
+      $("prompt").value = "";
+      render(final.result);
+      if (kind === "chat" && ["종료", "끝", "그만", "완료", "done"].includes(text.toLowerCase())) setStage("done");
+    }
+  } catch (e) {
+    endProgress(false);
+    showNotice("서버에 연결하지 못했습니다: " + e.message, "error");
+  } finally {
+    if (state.stage !== "done") $("send").disabled = false;
+  }
+}
+
+function render(data) {
+  const a = data.answer;
+  state.sessionId = a.session_id;
+  const hasReport = !!a.html;
+  $("plans").classList.toggle("hidden", hasReport);
+  $("report").classList.toggle("hidden", !hasReport);
+  if (hasReport) {
+    $("reportText").textContent = a.plainAnswer;
+    const frame = $("reportFrame");
+    frame.srcdoc = a.html;
+    frame.onload = () => { try { frame.style.height = frame.contentDocument.documentElement.scrollHeight + 40 + "px"; } catch (_) {} };
+    setStage("chat");
+    return;
+  }
+  // 3안 요약: 줄 단위로 카드를 만든다 ("- 맛집형: ..." 형식)
+  const lines = a.plainAnswer.split("\n");
+  const intro = lines.filter((l) => !l.startsWith("- "));
+  if (intro.length) showNotice(intro.join("\n"), "notice");
+  const cards = $("planCards");
+  cards.innerHTML = "";
+  lines.filter((l) => l.startsWith("- ")).forEach((l, i) => {
+    const [name, rest] = [l.slice(2, l.indexOf(":")), l.slice(l.indexOf(":") + 1).trim()];
+    const ok = !rest.includes("미충족"); // 예산 충족 또는 예산 제한 없음이면 정상 표시
+    const card = document.createElement("button");
+    card.className = "text-left rounded-2xl border border-slate-200 bg-white p-4 shadow-sm hover:border-indigo-400 hover:shadow transition";
+    const title = document.createElement("div");
+    title.className = "font-semibold";
+    title.textContent = `${PLAN_NO[name] || i + 1}번 ${name}`;
+    const desc = document.createElement("div");
+    desc.className = "mt-2 text-xs leading-relaxed " + (ok ? "text-slate-500" : "text-rose-600");
+    desc.textContent = rest;
+    card.append(title, desc);
+    card.onclick = () => send(`${PLAN_NO[name] || i + 1}번 안으로 할게`);
+    cards.appendChild(card);
+  });
+  $("plans").classList.remove("hidden");
+  setStage("select");
+}
+const PLAN_NO = { "맛집형": 1, "명소형": 2, "가성비형": 3 };
+
+$("send").onclick = () => send();
+$("prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+$("reset").onclick = () => {
+  state = { sessionId: null, stage: "new" };
+  ["plans", "report", "progress"].forEach((id) => $(id).classList.add("hidden"));
+  showNotice(""); $("prompt").value = ""; setStage("new");
+};
+setStage("new");
+</script>
+</body>
+</html>

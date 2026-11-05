@@ -46,3 +46,29 @@ def load_settings(env_path: Path | None = None) -> Settings:
             raise ConfigError(f"{key} 가 설정되지 않았습니다 (.env 확인)")
         found[key] = value
     return Settings(region=found["AWS_DEFAULT_REGION"], model_id=found["BEDROCK_MODEL_ID"])
+
+
+def _read_value(key: str, env_path: Path | None = None) -> str:
+    """환경변수(우선)와 .env 에서 값 하나를 읽는다. 없으면 빈 문자열."""
+    return os.environ.get(key) or _parse_env_file(env_path or ENV_PATH).get(key, "")
+
+
+def mockdata_use(env_path: Path | None = None) -> bool:
+    """MOCKDATA_USE 가 False(또는 0/no/off)면 MCP 연동, 그 외(미설정 포함)는 True: LLM 추정만 쓰는 기존 방식."""
+    return _read_value("MOCKDATA_USE", env_path).strip().lower() not in {"false", "0", "no", "off"}
+
+
+def google_maps_api_key(env_path: Path | None = None) -> str:
+    """Google Maps MCP 서버에 넘길 API 키를 읽는다. MOCKDATA_USE=False 인데 키가 없으면 ConfigError."""
+    key = _read_value("GOOGLE_MAPS_API_KEY", env_path)
+    if not key:
+        raise ConfigError("GOOGLE_MAPS_API_KEY 가 설정되지 않았습니다 (.env 확인)")
+    return key
+
+
+DEFAULT_MYREALTRIP_URL = "https://mcp-servers.myrealtrip.com/mcp"
+
+
+def myrealtrip_mcp_url(env_path: Path | None = None) -> str:
+    """마이리얼트립 MCP(HTTP) 주소. MYREALTRIP_MCP_URL 로 바꿀 수 있고 없으면 공개 기본 주소를 쓴다(키 불필요)."""
+    return _read_value("MYREALTRIP_MCP_URL", env_path) or DEFAULT_MYREALTRIP_URL

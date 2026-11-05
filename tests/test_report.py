@@ -45,3 +45,90 @@ def test_report_escapes_llm_strings():
     assert "<b>x</b>" not in html
     assert "&lt;script&gt;" in html
     assert "a&amp;b" in html
+
+
+def test_report_guide_tabs_render_and_escape():
+    """가이드가 있으면 2·3탭에 맛집·명소, 준비물, 목적지 사전 유의 정보가 들어가고 이스케이프된다."""
+    guide = {
+        "places": [{"kind": "맛집", "name": "<i>라멘집</i>", "area": "신주쿠", "description": "진한 국물", "tip": "점심 전 방문"},
+                   {"kind": "명소", "name": "센소지", "area": "아사쿠사", "description": "사찰", "tip": "아침 방문"}],
+        "packing": ["여권", "110V 어댑터"],
+        "cautions": [{"title": "소매치기", "detail": "붐비는 역 주의"}],
+        "destination_notes": [{"title": "입국", "detail": "출발 전 입국 요건 확인"}],
+    }
+    html = render_report_html("맛집형", [_item(1, "아침")], 100000, guide)
+    for text in ("맛집", "명소", "센소지", "여권", "110V 어댑터", "목적지 사전 유의 정보", "입국", "소매치기"):
+        assert text in html
+    assert "<i>라멘집</i>" not in html and "&lt;i&gt;" in html
+    assert "생성하지 못했습니다" in render_report_html("맛집형", [_item(1, "아침")], 100000)
+
+
+def test_report_schedule_has_origin_arrival_duration_columns():
+    """일정표에 출발지·도착지·소요시간 열이 있고 값이 이스케이프되어 들어간다."""
+    item = _item(1, "아침") | {"origin": "호텔", "arrival": "<센소지>", "duration": "약 30분"}
+    html = render_report_html("맛집형", [item], 100000)
+    for text in ("출발지", "도착지", "소요시간", "호텔", "약 30분", "&lt;센소지&gt;"):
+        assert text in html
+    assert "<센소지>" not in html
+    assert "출발지" in render_report_html("맛집형", [_item(1, "아침")], 100000)  # 값이 없어도 깨지지 않음
+
+
+def test_report_shows_escaped_price_note_when_given():
+    """참고 가격이 있으면 일정표 탭에 출처·비합산 안내와 함께 이스케이프되어 표시된다."""
+    html = render_report_html("맛집형", [_item(1, "아침")], 100000, None, "- <b>디즈니</b> 48,401원~")
+    assert "참고 가격" in html and "마이리얼트립" in html and "1인 가격 × 인원" in html
+    assert "<b>디즈니</b>" not in html and "&lt;b&gt;디즈니" in html
+    assert "참고 가격" not in render_report_html("맛집형", [_item(1, "아침")], 100000)
+
+
+def test_report_shows_unit_price_times_people_equals_total():
+    """1인 단위 항목은 '1인 가격 × 인원 = 전체 가격', 공용 항목은 합계만, 상단에 여행 인원이 표시된다."""
+    items = [
+        _item(1, "아침", "입장권", 26_000) | {"per_person": True, "unit_cost_krw": 13_000},
+        _item(1, "저녁", "숙박", 200_000),
+    ]
+    html = render_report_html("맛집형", items, 1_000_000, None, None, 2)
+    assert "13,000원 × 2명 = 26,000원" in html
+    assert "<td>200,000원</td>" in html
+    assert "여행 인원: 2명" in html and "1인 가격 × 인원 = 전체 가격" in html
+    assert "비용 합계: 226,000원" in html
+    plain = render_report_html("맛집형", [_item(1, "아침")], 1_000_000)
+    assert "×" not in plain and "여행 인원" not in plain
+
+
+def test_report_without_budget_has_no_balance_or_warning():
+    """예산이 없으면 '제한 없음'만 표시하고 잔액·초과 경고는 없다."""
+    html = render_report_html("맛집형", [_item(1, "아침", cost=9_999_999)], None, None, None, 2)
+    assert "사용자 예산: 제한 없음" in html
+    assert "잔액" not in html and "경고" not in html and "목표 예산" not in html
+
+
+def test_report_has_depart_and_arrive_time_columns_next_to_day():
+    """일차 바로 옆에 출발시간·도착시간 열이 있고 HH:MM 으로 표시되며, 잘못된 값은 비워지고 이스케이프된다."""
+    import re
+
+    items = [
+        _item(1, "아침", "공항 이동") | {"depart_time": "9:05", "arrive_time": "10:30"},
+        _item(1, "오후", "점심") | {"depart_time": "<b>x</b>", "arrive_time": ""},
+    ]
+    html = render_report_html("맛집형", items, 100000)
+    header = re.search(r"<thead><tr>(.*?)</tr></thead>", html).group(1)
+    assert header.startswith("<th>일차</th><th>출발시간</th><th>도착시간</th><th>시간대</th>")
+    first_row = re.findall(r"<tr>(.*?)</tr>", html)[1]
+    cells = re.findall(r"<td>(.*?)</td>", first_row)
+    assert cells[:4] == ["1일차", "09:05", "10:30", "아침"]
+    assert "<b>x</b>" not in html and "&lt;b&gt;" not in html  # 잘못된 시각은 값 자체를 보여주지 않는다
+
+
+def test_report_shows_default_origin_note():
+    """출발지 줄이 표시된다(기본값이면 그 사실도 표시)."""
+    html = render_report_html("맛집형", [_item(1, "아침")], 100000, None, None, 2, "서울 (입력이 없어 기본값)")
+    assert "출발지: 서울 (입력이 없어 기본값)" in html
+    assert "출발지:" not in render_report_html("맛집형", [_item(1, "아침")], 100000)
+
+
+def test_report_shows_period_basis():
+    """리포트 상단에 조회 기준 날짜가 표시된다(없으면 줄 자체가 없다)."""
+    html = render_report_html("맛집형", [_item(1, "아침")], 100000, None, None, 2, "서울", "2026-12-20 ~ 2026-12-22 (입력)")
+    assert "조회 기준 날짜: 2026-12-20 ~ 2026-12-22 (입력)" in html
+    assert "조회 기준 날짜" not in render_report_html("맛집형", [_item(1, "아침")], 100000)

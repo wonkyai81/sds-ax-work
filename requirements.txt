@@ -1,0 +1,14 @@
+fastapi>=0.162
+uvicorn>=0.54
+pydantic>=2.14
+langchain>=1.4
+langchain-core>=1.7
+langgraph>=1.2
+langchain-aws>=1.9
+langchain-mcp-adapters>=0.3
+mcp>=1.30
+langfuse>=5.0
+httpx>=0.28
+requests>=2.34
+streamlit>=1.66
+pytest>=9.2

@@ -50,5 +50,39 @@ def test_no_hardcoded_values_or_user_keys():
     """소스에 리전·모델 ID 값이 없고 API 키 입력 항목이 없다."""
     src = (ROOT / "src" / "config.py").read_text(encoding="utf-8")
     assert not re.search(r"us-east-1|anthropic\.claude", src)
-    assert not re.search(r"ACCESS_KEY|SECRET|api_key", src, re.I)
+    # 서버 환경변수로만 읽는 Google Maps MCP 키(GOOGLE_MAPS_API_KEY)는 허용하고, 그 밖의 키 항목은 없어야 한다
+    cleaned = re.sub(r"google_maps_api_key", "", src, flags=re.I)
+    assert not re.search(r"ACCESS_KEY|SECRET|api_key", cleaned, re.I)
     assert set(config.Settings.__dataclass_fields__) == {"region", "model_id"}
+
+
+def test_mockdata_use_defaults_true_and_reads_false(tmp_path, monkeypatch):
+    """MOCKDATA_USE 는 미설정이면 True, False/0/no/off 면 False 이고 환경변수가 .env 보다 우선한다."""
+    monkeypatch.delenv("MOCKDATA_USE", raising=False)
+    env = tmp_path / ".env"
+    assert config.mockdata_use(env) is True
+    env.write_text("MOCKDATA_USE = False\n", encoding="utf-8")
+    assert config.mockdata_use(env) is False
+    env.write_text("MOCKDATA_USE=True\n", encoding="utf-8")
+    assert config.mockdata_use(env) is True
+    monkeypatch.setenv("MOCKDATA_USE", "off")
+    assert config.mockdata_use(env) is False
+
+
+def test_google_maps_key_required_when_missing(tmp_path, monkeypatch):
+    """키가 없으면 ConfigError, 있으면 값을 돌려준다."""
+    monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
+    env = tmp_path / ".env"
+    with pytest.raises(config.ConfigError):
+        config.google_maps_api_key(env)
+    env.write_text("GOOGLE_MAPS_API_KEY=abc\n", encoding="utf-8")
+    assert config.google_maps_api_key(env) == "abc"
+
+
+def test_myrealtrip_url_default_and_override(tmp_path, monkeypatch):
+    """마이리얼트립 MCP 주소는 기본값이 있고(키 불필요) 환경변수로 바꿀 수 있다."""
+    monkeypatch.delenv("MYREALTRIP_MCP_URL", raising=False)
+    env = tmp_path / ".env"
+    assert config.myrealtrip_mcp_url(env) == config.DEFAULT_MYREALTRIP_URL
+    env.write_text("MYREALTRIP_MCP_URL=http://localhost:9/mcp\n", encoding="utf-8")
+    assert config.myrealtrip_mcp_url(env) == "http://localhost:9/mcp"

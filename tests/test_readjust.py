@@ -55,6 +55,8 @@ def test_closest_attempt_and_warning_after_three_failures():
     per_item = {"맛집형": [1_000_000, 700_000, 900_000, 800_000]}
 
     def planner(prompt):
+        if "여행 가이드" in prompt:  # 선택 후 가이드 생성 호출은 일정 횟수에 세지 않는다
+            return make_output(1)
         if "맛집" in prompt:
             planner.count += 1
             return make_output(per_item["맛집형"][planner.count - 1])
