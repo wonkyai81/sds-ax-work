@@ -275,15 +275,15 @@ def compact_price_result(name: str, raw: str) -> str:
                 info = i["travelInfo"]
                 kind = "직항" if info.get("isDirect") else f"경유 {info.get('stops', '?')}회"
                 legs = i.get("legs") or []
-                flight_no = ""
-                if legs and legs[0].get("segments"):
-                    flight_no = str(legs[0]["segments"][0].get("flightNumber", ""))
-                legs_text = " / ".join(
-                    f"{label} {_flight_leg(leg['origin'], leg['destination'], leg)}"
-                    for label, leg in zip(("가는 편", "오는 편"), legs)
-                )
+
+                def leg_text(label: str, leg: dict) -> str:
+                    """구간별 편명을 따로 적는다(가는 편과 오는 편의 편명이 다르다)."""
+                    segments = leg.get("segments") or [{}]
+                    return f"{label} {segments[0].get('flightNumber', '')} {_flight_leg(leg['origin'], leg['destination'], leg)}"
+
+                legs_text = " / ".join(leg_text(label, leg) for label, leg in zip(("가는 편", "오는 편"), legs))
                 rows.append(
-                    f"- {i['airline']['name']} {flight_no} {kind} {legs_text} / 1인 왕복 합계 {_won(int(i['price']['total']))}"
+                    f"- {i['airline']['name']} {kind} {legs_text} / 1인 왕복 합계 {_won(int(i['price']['total']))}"
                 )
             return "국제선(성인 1명 기준, 실시간 변동)\n" + "\n".join(rows)
         if name == "searchDomesticFlights":

@@ -88,14 +88,14 @@ def test_compact_price_result_trims_big_mcp_json():
             {"origin": "PUS", "destination": "NRT", "departDate": "2026-12-10", "departTime": "08:20", "arriveDate": "2026-12-10",
              "arriveTime": "10:25", "segments": [{"flightNumber": "0717"}]},
             {"origin": "NRT", "destination": "PUS", "departDate": "2026-12-14", "departTime": "11:25", "arriveDate": "2026-12-14",
-             "arriveTime": "13:55"},
+             "arriveTime": "13:55", "segments": [{"flightNumber": "0718"}]},
         ],
         "price": {"total": 335600},
     }]}}
     text = compact_price_result("searchInternationalFlights", json.dumps(flight))
-    assert "에어부산 0717 직항" in text and "1인 왕복 합계 335,600원" in text
-    assert "가는 편 PUS→NRT 2026-12-10 08:20→2026-12-10 10:25" in text  # 가는 편 날짜·시각
-    assert "오는 편 NRT→PUS 2026-12-14 11:25→2026-12-14 13:55" in text  # 귀국 편 날짜·시각
+    assert "에어부산 직항" in text and "1인 왕복 합계 335,600원" in text
+    assert "가는 편 0717 PUS→NRT 2026-12-10 08:20→2026-12-10 10:25" in text  # 가는 편 편명·날짜·시각
+    assert "오는 편 0718 NRT→PUS 2026-12-14 11:25→2026-12-14 13:55" in text  # 귀국 편은 자기 편명을 쓴다
     domestic = {"result": {"items": [{
         "airline": {"name": "에어서울"},
         "outbound": {"flightNumber": "RS6439", "departCity": "GMP", "arriveCity": "CJU", "departDate": "2026-12-05",
