@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel
 
-from src.agent import PLAN_TYPES, build_answer, build_graph
+from src.agent import PLAN_TYPES, build_answer, build_graph, build_model, extract_trip
 from src.tools import CONFLICT_NOTICE, classify_request, has_conflict, merge_trip, restates_trip
 
 logger = logging.getLogger("uvicorn.error")
@@ -68,6 +68,7 @@ _COUNTRIES = (
     "인도네시아", "말레이시아", "호주", "캐나다", "튀르키예", "터키", "스위스", "체코", "오스트리아", "포르투갈", "그리스", "이집트",
     "인도", "몽골", "라오스", "캄보디아", "뉴질랜드", "멕시코", "러시아", "네덜란드", "헝가리", "크로아티아", "노르웨이", "핀란드",
 )  # '중국 장가계'처럼 나라 이름이 앞에 붙으면 도시를 여행지로 본다
+_FILLED_TRIP = {"destination": "-", "days": 1, "people": 1}  # classify_request 의 누락 검사를 통과시키는 자리표시 값(원문 규칙 검사만 먼저 하려고 쓴다)
 _COUNTRY_RE = "|".join(_COUNTRIES)
 _FILLER = {"여행", "가족여행", "해외여행", "국내여행", "일정", "계획", "여행지"}  # 여행지와 날짜 사이에 끼어도 되는 말
 _NOT_PLACE = _STOPWORDS | {"가족여행", "해외여행", "국내여행", "여행지", "가족", "친구", "예정", "예정이야", "예정이에요", "이번", "다음", "내일", "올해"}
@@ -147,8 +148,24 @@ def parse_dates(question: str, today: date | None = None) -> tuple[date | None, 
     return start, end, cleaned
 
 
+def _parse_labeled_route(question: str) -> tuple[str | None, str | None] | None:
+    """'서울 출발 도쿄 도착', '서울발 도쿄행', '출발지는 서울, 도착지는 도쿄', '출발: 부산 도착: 오사카'처럼 출발·도착을 말로 밝힌 문장을 읽는다. 없으면 None."""
+    m = re.search(rf"({_PLACE})\s*출발\s+(?:(?:{_COUNTRY_RE})\s+)?({_PLACE})\s*도착", question) or re.search(rf"({_PLACE}?)발\s+({_PLACE}?)행(?![가-힣])", question)
+    if m:
+        origin, dest = _place_token(m.group(1)), _place_token(m.group(2))
+        return (origin or None, dest or None) if (origin or dest) else None
+    o = re.search(rf"출발지?(?:은|는|이|가)?\s*[:：]\s*(?:(?:{_COUNTRY_RE})\s+)?({_PLACE})", question) or re.search(rf"출발지(?:은|는|이|가)?\s*(?:(?:{_COUNTRY_RE})\s+)?({_PLACE})", question)
+    d = re.search(rf"도착지?(?:은|는|이|가)?\s*[:：]\s*(?:(?:{_COUNTRY_RE})\s+)?({_PLACE})", question) or re.search(rf"도착지(?:은|는|이|가)?\s*(?:(?:{_COUNTRY_RE})\s+)?({_PLACE})", question)
+    origin = _place_token(o.group(1)) if o else ""
+    dest = _place_token(d.group(1)) if d else ""
+    return (origin or None, dest or None) if (origin or dest) else None
+
+
 def parse_route(question: str) -> tuple[str | None, str | None]:
     """출발지와(명시된 경우) 목적지를 뽑는다. 'A에서 B로', 'A → B', 'A 출발' 형태만 출발지로 읽고, '제주에서 3박'처럼 에서만 있으면 읽지 않는다."""
+    labeled = _parse_labeled_route(question)
+    if labeled:
+        return labeled
     m = re.search(rf"({_PLACE})\s*(?:->|→|➡|➜)\s*({_PLACE})", question)
     if not m:
         m = re.search(rf"({_PLACE})에서\s*({_PLACE}?)(?:으로|로|까지|행)(?![가-힣])", question)
@@ -287,10 +304,30 @@ def _run_config(session_id: str) -> dict:
     return config
 
 
-def create_app(graph: Any | None = None) -> FastAPI:
-    """FastAPI 앱을 만든다. graph 를 주면 그 그래프를 쓰고, 없으면 첫 요청에서 만든다."""
+def resolve_trip(question: str, model: Any | None) -> dict:
+    """문장에서 여행 정보를 뽑는다. 모델이 판단한 값을 쓰고, 코드는 빈 값만 확인해 비어 있는 항목은 규칙 파서(parse_trip) 값으로 채운다.
+
+    model 이 없거나 호출이 실패하면 규칙 파서 결과를 그대로 쓴다(키와 오류 내용은 로그에 남기지 않는다).
+    """
+    rules = parse_trip(question)
+    if model is None:
+        return rules
+    try:
+        found = extract_trip(model, question)
+    except Exception as exc:  # 모델 호출·형식 오류는 규칙 파서로 대신한다
+        logger.warning("여행 정보 추출 실패, 규칙 파서로 대신합니다: %s", type(exc).__name__)
+        return rules
+    return {key: found.get(key) or rules.get(key) for key in rules}
+
+
+def create_app(graph: Any | None = None, extractor_model: Any | None = None) -> FastAPI:
+    """FastAPI 앱을 만든다. graph 를 주면 그 그래프를 쓰고, 없으면 첫 요청에서 만든다.
+
+    새 요청의 여행 정보는 모델이 뽑는다. extractor_model 을 주면 그 모델을 쓰고, graph 도 extractor_model 도 없으면(실서비스) 첫 요청에서 모델을 만든다.
+    graph 만 주면(테스트) 모델을 부르지 않고 규칙 파서만 쓴다.
+    """
     app = FastAPI(title="여행 일정 에이전트")
-    holder: dict = {"graph": graph}
+    holder: dict = {"graph": graph, "extractor": extractor_model}
     known_trips: dict[str, dict] = {}  # 정보 부족으로 이어가는 세션의 파싱값(서버 메모리, 그래프 시작 전)
 
     def get_graph():
@@ -298,6 +335,12 @@ def create_app(graph: Any | None = None) -> FastAPI:
         if holder["graph"] is None:
             holder["graph"] = build_graph()
         return holder["graph"]
+
+    def get_extractor():
+        """여행 정보 추출용 모델. 실서비스에서는 첫 요청에서 한 번 만들고, 테스트(그래프만 주입)에서는 None 이다."""
+        if holder["extractor"] is None and graph is None:
+            holder["extractor"] = build_model()
+        return holder["extractor"]
 
     @app.exception_handler(RequestValidationError)
     async def _validation(request: Request, exc: RequestValidationError):
@@ -334,7 +377,10 @@ def create_app(graph: Any | None = None) -> FastAPI:
         new_trip = body.session_id is None or body.session_id in known_trips
         trip = None
         if new_trip:
-            parsed = parse_trip(question)
+            early = classify_request(question, _FILLED_TRIP, True)  # 비밀·개인정보·실시간 조회 요청은 모델을 부르기 전에 규칙으로 거절한다(누락 검사는 제외)
+            if early:
+                raise ApiError(422, early["code"], early["message"])
+            parsed = resolve_trip(question, get_extractor())
             known = known_trips.get(body.session_id)
             if restates_trip(known, parsed):  # 이미 알던 기간·날짜를 다시 말하면 새 요청이다(이전 여행지를 물려받지 않는다)
                 known = None

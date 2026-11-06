@@ -28,7 +28,7 @@
   │ POST /query/stream {question, session_id?}
   ▼
 api.process
-  ├─ 새 요청:  parse_trip → classify_request(가드레일) → 그래프 시작
+  ├─ 새 요청:  classify_request(원문 규칙) → resolve_trip(모델 추출 + 빈 값은 parse_trip) → classify_request(가드레일) → 그래프 시작
   └─ 이어서:   체크포인트의 대기 stage 읽기
                  select → (수정 표현이면 거절) → 안 선택으로 재개
                  chat   → '종료'면 종료, 아니면 수정 요청으로 재개
@@ -59,7 +59,8 @@ api.process
 - 오류는 항상 `{"error": {"code", "message"}}`, 상태는 422/404/500.
 
 ### 3.2 새 요청 처리 순서
-1. `parse_trip(question)`이 문장에서 여행지·일수·인원·예산·출발지·시작일을 규칙(정규식)으로 뽑음. 날짜는 `parse_dates`(`12월 20일부터 23일까지`, `2026-12-20~22` 등), 인원은 `parse_people`, 구간은 `parse_route`.
+0. 비밀·개인정보·실시간 조회 요청은 모델을 부르기 전에 `classify_request`(원문 규칙)로 거절. 이어서 `resolve_trip`이 `extract_trip`(구조화 출력 `TripExtraction`)으로 여행지·일수·인원·예산·출발지·시작일을 모델에서 받고, 빈 항목은 규칙 파서 값으로 채움(모델이 없거나 실패하면 규칙 파서 결과를 그대로 사용).
+1. `parse_trip(question)`은 규칙(정규식) 파서로, 빈 값 보완과 폴백에 씀. 날짜는 `parse_dates`(`12월 20일부터 23일까지`, `2026-12-20~22` 등), 인원은 `parse_people`, 구간은 `parse_route`.
 2. `merge_trip`: 정보가 부족해 되묻는 중인 세션(`known_trips`, 서버 메모리)의 이전 값에 새 값을 덮어 합침.
 3. `classify_request`(LLM 미사용, `tools.py`):
    - 비밀 요청(`secret_request`), 개인정보 요청(`personal_data_request`)은 모든 요청에 적용.

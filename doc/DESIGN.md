@@ -292,7 +292,7 @@ langgraph-design 6절 표를 따릅니다.
 | `POST /query/stream` | 같은 처리를 NDJSON 으로 반환. 노드가 끝날 때마다 `{"step": 노드}`, 마지막에 `{"result": …}` 또는 `{"error": …, "status": …}`. 워커 스레드가 큐에 넣고 응답 제너레이터가 읽음 |
 | `GET /` | `web/index.html` (웹 UI) |
 
-- 새 요청의 문장 해석(`parse_trip`)은 규칙(정규식)으로 합니다. 여행지·일수·인원(`parse_people`)·예산·출발지·도착지(`parse_route`)·날짜(`parse_dates`)를 뽑고, LLM 을 쓰지 않습니다.
+- 새 요청의 문장 해석은 모델이 합니다(`extract_trip`, 구조화 출력 `TripExtraction`: 여행지·출발지·일수·인원·예산·시작일). 코드는 빈 값만 확인해 비어 있는 항목을 규칙 파서(`parse_trip`: `parse_people`·`parse_route`·`parse_dates`)의 값으로 채우고, 모델 호출이 실패하면 규칙 파서 결과를 그대로 씁니다. 가드레일은 이 앞뒤에서 규칙으로 동작합니다.
 
 ## 11. 리포트 구성 (AC4)
 
@@ -387,7 +387,7 @@ langgraph-design 6절 표를 따릅니다.
 
 ## 16. 요청 분류(Guardrail)와 안내·거절 응답
 
-여행 요청이 아닌 입력과 정보가 부족한 입력을 그래프 호출 **전에** 규칙으로 가려냅니다. LLM을 쓰지 않습니다.
+여행 요청이 아닌 입력과 정보가 부족한 입력을 그래프 호출 **전에** 규칙으로 가려냅니다. 가드레일 판정에는 LLM을 쓰지 않습니다(비밀·개인정보·실시간 조회는 원문 규칙으로 모델 호출 전에 거절하고, 필수 항목 누락은 추출 결과의 빈 값을 코드가 판정합니다).
 
 ### 위치와 구성
 - 규칙 함수 `classify_request(question, known_trip)` 는 `src/tools.py` 에 둡니다 (결정적 로직, LLM 호출 없음). 새 파일(`src/guardrail.py` 등)은 사용자 허가 없이 만들지 않습니다.

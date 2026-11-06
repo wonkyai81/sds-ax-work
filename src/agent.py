@@ -1,5 +1,6 @@
 """여행 일정 에이전트 그래프: LangGraph StateGraph (DESIGN 2~9절). 예산 판정은 tools.py 코드가 한다."""
 import logging
+from datetime import date
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain.agents import create_agent
@@ -142,6 +143,17 @@ class RegionOutput(BaseModel):
     overseas: bool
     currency: str = ""  # 현지 통화 ISO 4217 코드(예: SGD). 국내면 KRW
     weather_query: str = ""  # OpenWeatherMap 도시 검색어, 영어 'City,국가코드'(예: Singapore,SG)
+
+
+class TripExtraction(BaseModel):
+    """여행 요청 문장에서 모델이 뽑은 값. 문장에 없는 값은 빈 값(문자열 '', 숫자 0)으로 둔다."""
+
+    destination: str = ""  # 도착지(여행지). 도시·지역 이름만(나라 이름은 도시가 없을 때만)
+    origin: str = ""  # 출발지. 문장에 밝힌 경우만
+    days: int = 0  # 여행 일수(n박 m일이면 m, 당일치기 1)
+    people: int = 0  # 여행 인원(성인 수)
+    budget_krw: int = 0  # 전체 예산(원 단위 숫자)
+    start_date: str = ""  # 문장에 밝힌 여행 시작일 YYYY-MM-DD
 
 
 class PlaceQuery(BaseModel):
@@ -319,6 +331,39 @@ def _load_maps() -> Any | None:
     except Exception as exc:
         logger.warning("Google Maps MCP 연결 실패, LLM 추정 방식으로 진행합니다: %s", type(exc).__name__)
         return None
+
+
+def extract_trip(model: Any, question: str, today: date | None = None) -> dict:
+    """여행 요청 문장을 모델에 구조화 출력으로 보내 여행지·출발지·일수·인원·예산·시작일을 뽑는다.
+
+    parse_trip 과 같은 모양({destination, days, people, budget_krw, origin, start_date})으로 돌려주며 빈 값은 ''/None 이다.
+    호출·파싱이 실패하면 예외를 그대로 올린다(호출하는 쪽이 규칙 파서로 대신한다).
+    """
+    today = today or date.today()
+    prompt = (
+        f"오늘은 {today.isoformat()}입니다. 아래 여행 요청 문장에서 값을 뽑으세요. 문장에 없는 값은 지어내지 말고 비워 두세요(문자열 '', 숫자 0). "
+        "destination 은 도착지(여행지)로 도시·지역 이름만 쓰고('중국 장가계'는 '장가계'), 도시가 없을 때만 나라 이름을 쓰세요. "
+        "origin 은 출발지로 문장에 밝힌 경우만 쓰세요. days 는 여행 일수(3박 4일이면 4, 당일치기면 1, 날짜 범위면 시작~종료 포함 일수), "
+        "people 은 여행 인원(성인 수), budget_krw 는 전체 예산을 원 단위 숫자로(500만원이면 5000000), "
+        "start_date 는 문장에 밝힌 여행 시작일을 YYYY-MM-DD 로(연도가 없으면 오늘 이후 가장 가까운 날짜) 쓰세요.\n"
+        f"문장: {question}"
+    )
+    out = model.with_structured_output(TripExtraction).invoke(prompt)
+    if isinstance(out, dict):
+        out = TripExtraction.model_validate(out)
+    if not isinstance(out, TripExtraction):
+        raise ValueError("여행 정보 추출 결과 형식이 올바르지 않습니다")
+    start = None
+    try:
+        parsed_date = date.fromisoformat(out.start_date.strip()) if out.start_date.strip() else None
+        start = parsed_date.isoformat() if parsed_date and parsed_date >= today else None  # 지난 날짜는 쓰지 않는다(기본값 D+30)
+    except ValueError:
+        start = None
+    return {
+        "destination": out.destination.strip(), "days": out.days if out.days > 0 else None,
+        "people": out.people if out.people > 0 else None, "budget_krw": out.budget_krw if out.budget_krw > 0 else None,
+        "origin": out.origin.strip() or None, "start_date": start,
+    }
 
 
 def _is_overseas(model: Any, destination: str) -> bool:
