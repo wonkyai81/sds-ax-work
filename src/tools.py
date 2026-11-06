@@ -826,15 +826,24 @@ _AFTER_MIDNIGHT_BEFORE = "06:00"  # 저녁 시간대 항목이 이 시각 전에
 
 
 def ordered_schedule(items: list[ItineraryItem]) -> list[ItineraryItem]:
-    """일정을 (일차, 시간대, 시각) 순으로 정렬한다. 출발 시각이 빈 항목은 같은 일차의 앞 항목 시각을 빌려 입력 순서를 유지한다."""
+    """일정을 (일차, 실제 출발 시각) 순으로 정렬한다. 시간대(아침/오후/저녁) 이름은 시각이 같거나 없을 때만 순서를 가른다.
+
+    모델이 붙인 시간대가 시각과 어긋나도(예: 08:25 귀국 항공이 '아침', 06:30 공항 이동이 '오후') 시각대로 놓이므로 시간 순서가 뒤집히지 않는다.
+    출발 시각이 빈 항목은 같은 일차의 앞 항목 시각을 빌려 입력 순서를 유지하고(앞 항목도 없으면 시간대 기본 시각),
+    저녁 시간대의 06:00 전 시각은 자정을 넘긴 것이라 그 일차의 맨 뒤로 보낸다.
+    """
     keyed, last_time, last_day = [], "", None
     for pos, item in enumerate(items):
-        if int(item["day"]) != last_day:
-            last_day, last_time = int(item["day"]), ""
+        day = int(item["day"])
+        if day != last_day:
+            last_day, last_time = day, ""
+        slot = item.get("time_slot")
         shown = normalize_time(item.get("depart_time"))
-        last_time = shown or last_time
-        key = schedule_sort_key({**item, "depart_time": last_time}) if last_time else schedule_sort_key(item)
-        keyed.append((key, pos, item))
+        time = shown or last_time or _hhmm(_SLOT_START_MIN.get(str(slot), 12 * 60))
+        if shown:
+            last_time = shown
+        after_midnight = slot == "저녁" and time < _AFTER_MIDNIGHT_BEFORE
+        keyed.append(((day, after_midnight, time, _SLOTS.index(slot) if slot in _SLOTS else 3), pos, item))
     return [item for _, _, item in sorted(keyed, key=lambda t: (t[0], t[1]))]
 
 

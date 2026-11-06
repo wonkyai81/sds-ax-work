@@ -690,3 +690,17 @@ def test_carry_over_times_fills_blank_from_previous_attempt():
     result = carry_over_times(new, old)
     assert (result[0]["depart_time"], result[0]["arrive_time"]) == ("12:00", "13:00")
     assert result[1]["depart_time"] == ""
+
+
+def test_ordered_schedule_sorts_by_actual_time_not_slot_label():
+    """시간대 이름이 시각과 어긋나도 시각 순으로 놓여, 마지막 시각의 귀국 항공이 중간에 끼지 않는다."""
+    from src.tools import ordered_schedule
+
+    items = [
+        _timed(4, "아침", "베이징→부산 귀국 항공", "08:25", "11:45"),
+        _timed(4, "오후", "호텔 체크아웃·공항 이동", "05:30", "07:30"),  # 모델이 '오후'로 잘못 붙인 이른 시각
+        _timed(4, "아침", "공항 수속", "07:30", "08:15"),
+        _timed(4, "오후", "부산 도착 후 귀가", "12:30", "14:00"),
+    ]
+    assert [i["activity"] for i in ordered_schedule(items)] == [
+        "호텔 체크아웃·공항 이동", "공항 수속", "베이징→부산 귀국 항공", "부산 도착 후 귀가"]
