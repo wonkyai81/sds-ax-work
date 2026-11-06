@@ -27,6 +27,14 @@ def to_selected(planner, script, plan="맛집형", thread="e1"):
     return graph, cfg
 
 
+TIME_KEYS = ("depart_time", "arrive_time")
+
+
+def without_times(item):
+    """시각은 비어 있으면 코드가 채우므로 비교에서 뺀다."""
+    return {k: v for k, v in item.items() if k not in TIME_KEYS}
+
+
 def base_items(per_item=50_000):
     """선택 안의 원본 항목 목록(딕셔너리)."""
     return [i.model_dump() for i in make_output(per_item).items]
@@ -41,7 +49,8 @@ def test_chat_edit_changes_only_requested_part():
     state = graph.get_state(cfg).values
     assert state["selected_items"][2]["activity"] == "스시 맛집"
     for idx in (0, 1, 3, 4, 5):
-        assert state["selected_items"][idx] == items[idx]  # 요청하지 않은 부분은 그대로
+        got = {k: v for k, v in state["selected_items"][idx].items() if k not in TIME_KEYS}  # 시각은 비어 있으면 코드가 채운다
+        assert got == {k: v for k, v in items[idx].items() if k not in TIME_KEYS}  # 요청하지 않은 부분은 그대로
     assert "chat_edit" in result["trace"]
     assert "readjust_selected" not in result["trace"]  # 예산 이내면 재조정 없음
     assert "330,000" in result["__interrupt__"][0].value["plainAnswer"]  # 수정 후 합계
@@ -84,6 +93,6 @@ def test_chat_edit_without_submission_keeps_items():
     graph, cfg = to_selected(lambda p: make_output(50_000), [AIMessage(content="수정하지 못했습니다")])
     result = graph.invoke(Command(resume={"type": "chat", "text": "아무거나"}), cfg)
     state = graph.get_state(cfg).values
-    assert state["selected_items"] == items
+    assert [without_times(i) for i in state["selected_items"]] == [without_times(i) for i in items]
     assert state["errors"]
     assert "readjust_selected" not in result["trace"]

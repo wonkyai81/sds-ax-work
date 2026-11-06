@@ -169,7 +169,7 @@ def finalize_items(
         if floored:
             new["note"] = f"{FLOOR_NOTE} {new.get('note') or ''}".strip()
         result.append(new)
-    return apply_headcount(result, people)
+    return fill_missing_times(apply_headcount(result, people))
 
 
 def check_budget(plan_type: str, items: list[ItineraryItem], budget_krw: int | None) -> dict:
@@ -198,10 +198,30 @@ def readjust_count(attempts: list) -> int:
     return max(len(attempts) - 1, 0)
 
 
+FIXED_NOTE_PREFIXES = ("왕복", "조회 요금", "Google 가격대", FLOOR_NOTE)  # finalize_items 가 금액을 확정하며 비고 앞에 붙이는 표지. 이 항목은 재조정으로 줄일 수 없다
+
+
+def fixed_cost(items: list[ItineraryItem]) -> int:
+    """재조정으로 줄일 수 없는 비용의 합계. 조회값(항공·숙소·식당 가격대)이나 최소 단가로 코드가 확정한 항목만 더한다."""
+    return sum(
+        int(i.get("cost_krw") or 0) for i in items if str(i.get("note") or "").startswith(FIXED_NOTE_PREFIXES)
+    )
+
+
+def is_unreachable(plan_type: str, items: list[ItineraryItem], budget_krw: int | None) -> bool:
+    """줄일 수 없는 비용만으로 이미 목표 예산을 넘으면 True. 이 경우 재조정을 반복해도 목표를 맞출 수 없다."""
+    target = target_budget(plan_type, budget_krw)
+    return target is not None and fixed_cost(items) > target
+
+
 def needs_readjust(plan_type: str, attempts: list[list[ItineraryItem]], budget_krw: int) -> bool:
-    """마지막 시도가 초과이고 재조정 횟수가 3회 미만이면 True."""
+    """마지막 시도가 초과이고 재조정 횟수가 3회 미만이며, 줄일 수 없는 비용만으로 목표를 넘지는 않으면 True."""
     last = check_budget(plan_type, attempts[-1], budget_krw)
-    return (not last["within"]) and readjust_count(attempts) < MAX_READJUST
+    return (
+        (not last["within"])
+        and readjust_count(attempts) < MAX_READJUST
+        and not is_unreachable(plan_type, attempts[-1], budget_krw)
+    )
 
 
 def final_items(plan_type: str, attempts: list[list[ItineraryItem]], budget_krw: int) -> list[ItineraryItem]:
@@ -259,12 +279,110 @@ def period_label(trip: dict, today: date | None = None) -> str:
     return f"{start.isoformat()} ~ {end.isoformat()} ({'입력이 없어 D+30 기본값' if is_default else '입력'})"
 
 
-def normalize_time(value: Any) -> str:
-    """'9:05', '09:05' 같은 시각을 'HH:MM'으로 맞춘다. 형식이 틀리면 빈 문자열(깨진 값을 보여주지 않는다)."""
-    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(value or ""))
-    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+def normalize_time(value: Any, end: bool = False) -> str:
+    """'9:05', '09:05:00', '9시 30분', '오후 3:20', '09:00~10:00', '0900' 같은 시각을 'HH:MM'으로 맞춘다.
+
+    범위('09:00~10:00')는 end=False 면 앞의 시각, end=True 면 뒤의 시각을 쓴다. '24:00'은 '00:00'. 해석할 수 없으면 빈 문자열(깨진 값을 보여주지 않는다).
+    """
+    text = str(value or "").strip()
+    parts = [p for p in re.split(r"\s*[~–—-]\s*", text) if p]
+    if not parts:
         return ""
-    return f"{int(m.group(1)):02d}:{m.group(2)}"
+    text = parts[-1 if end else 0]
+    m = re.fullmatch(
+        r"(오전|오후|am|pm)?\s*(\d{1,2})\s*(?:[:.]\s*(\d{2})(?:[:.]\d{2})?|시\s*(?:(\d{1,2})\s*분?)?)\s*(am|pm)?",
+        text, re.IGNORECASE,
+    )
+    if m:
+        hour, minute = int(m.group(2)), int(m.group(3) or m.group(4) or 0)
+        meridiem = (m.group(1) or m.group(5) or "").lower()
+    else:
+        m = re.fullmatch(r"(\d{2})(\d{2})", text)
+        if not m:
+            return ""
+        hour, minute, meridiem = int(m.group(1)), int(m.group(2)), ""
+    if meridiem in ("오후", "pm") and hour < 12:
+        hour += 12
+    elif meridiem in ("오전", "am") and hour == 12:
+        hour = 0
+    if hour == 24 and minute == 0:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return ""
+    return f"{hour:02d}:{minute:02d}"
+
+
+_SLOT_START_MIN = {"아침": 8 * 60, "오후": 12 * 60, "저녁": 18 * 60}  # 시각이 비었을 때 시간대별 기본 시작 시각(분)
+_DEFAULT_MEAL_MIN, _DEFAULT_ACTIVITY_MIN = 60, 120  # 시각이 비었을 때 식사·그 밖 활동의 기본 소요(분)
+
+
+def _minutes(hhmm: str) -> int | None:
+    """'HH:MM' 을 분으로 바꾼다. 비었으면 None."""
+    return int(hhmm[:2]) * 60 + int(hhmm[3:]) if hhmm else None
+
+
+def _hhmm(minutes: int) -> str:
+    """분을 'HH:MM'으로 바꾼다(하루를 넘기지 않도록 23:59 로 자른다)."""
+    minutes = max(0, min(minutes, 23 * 60 + 59))
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def carry_over_times(items: list[ItineraryItem], previous: list[ItineraryItem]) -> list[ItineraryItem]:
+    """재조정·수정 결과에서 시각이 빈 항목에 직전 시도의 같은 항목(같은 일차·활동명) 시각을 채운다(원본은 바꾸지 않는다)."""
+    known = {
+        (int(i["day"]), str(i.get("activity", ""))): i
+        for i in previous
+        if normalize_time(i.get("depart_time")) or normalize_time(i.get("arrive_time"), end=True)
+    }
+    result = []
+    for item in items:
+        new = dict(item)
+        old = known.get((int(new["day"]), str(new.get("activity", ""))))
+        if old:
+            for key in ("depart_time", "arrive_time"):
+                if not normalize_time(new.get(key), end=key == "arrive_time"):
+                    new[key] = old.get(key, "")
+        result.append(new)
+    return result
+
+
+def fill_missing_times(items: list[ItineraryItem]) -> list[ItineraryItem]:
+    """시각이 빈 항목의 출발·도착 시각을 앞뒤 항목에서 추정해 채운다(원본은 바꾸지 않는다).
+
+    같은 일차 안에서 목록 순서대로 보며, 시작은 앞 항목의 도착 시각(없으면 시간대 기본 시각), 끝은 시작 + 기본 소요(식사 60분, 그 밖 120분)로 한다.
+    뒤에 시각이 있는 항목이 있으면 그 출발 시각을 넘지 않게 맞춘다. 이미 있는 시각은 바꾸지 않는다.
+    """
+    result = [dict(i) for i in items]
+    by_day: dict[int, list[int]] = {}
+    for k, item in enumerate(result):
+        by_day.setdefault(int(item["day"]), []).append(k)
+    for indexes in by_day.values():
+        for pos, k in enumerate(indexes):
+            item = result[k]
+            start = _minutes(normalize_time(item.get("depart_time")))
+            end = _minutes(normalize_time(item.get("arrive_time"), end=True))
+            if start is not None and end is not None:
+                continue
+            duration = _DEFAULT_MEAL_MIN if is_restaurant(item) else _DEFAULT_ACTIVITY_MIN
+            if start is None:
+                if end is not None:
+                    start = max(end - duration, 0)
+                else:
+                    prev_end = next((e for e in (
+                        _minutes(normalize_time(result[j].get("arrive_time"), end=True)) for j in reversed(indexes[:pos])
+                    ) if e is not None), None)
+                    base = _SLOT_START_MIN.get(str(item.get("time_slot")), 12 * 60)
+                    start = max(prev_end, base) if prev_end is not None else base
+            if end is None:
+                end = start + duration
+                next_start = next((s for s in (
+                    _minutes(normalize_time(result[j].get("depart_time"))) for j in indexes[pos + 1:]
+                ) if s is not None), None)
+                if next_start is not None and end > next_start:
+                    end = max(next_start, start)
+                    start = min(start, max(end - 30, 0))
+            item["depart_time"], item["arrive_time"] = _hhmm(start), _hhmm(end)
+    return result
 CONFLICT_NOTICE = "안내: 요청하신 조건(최고급·5성급과 최소 비용)이 서로 충돌해 예산을 우선해 안을 만들었습니다."
 
 _GUARD_MESSAGES = {
@@ -288,6 +406,16 @@ def merge_trip(known: dict | None, parsed: dict) -> dict:
         else:
             merged.setdefault(key, parsed.get(key))
     return merged
+
+
+def restates_trip(known: dict | None, parsed: dict) -> bool:
+    """정보 부족으로 이어 가던 세션에서 새 문장이 이미 알던 기간·시작일을 다시 말하면 이어 답하는 게 아니라 새 요청으로 본다.
+
+    새 요청인데 여행지를 못 읽었다고 이전 여행지를 그대로 쓰면 엉뚱한 여행지로 일정이 나온다. 인원처럼 비어 있던 값만 채우는 답은 이어 답하기다.
+    """
+    if not known:
+        return False
+    return bool((known.get("days") and parsed.get("days")) or (known.get("start_date") and parsed.get("start_date")))
 
 
 def has_conflict(question: str) -> bool:
@@ -697,6 +825,19 @@ _SLOTS = ("아침", "오후", "저녁")
 _AFTER_MIDNIGHT_BEFORE = "06:00"  # 저녁 시간대 항목이 이 시각 전에 시작하면 자정을 넘긴 것(야간 항공 도착 후 이동·체크인 등)으로 본다
 
 
+def ordered_schedule(items: list[ItineraryItem]) -> list[ItineraryItem]:
+    """일정을 (일차, 시간대, 시각) 순으로 정렬한다. 출발 시각이 빈 항목은 같은 일차의 앞 항목 시각을 빌려 입력 순서를 유지한다."""
+    keyed, last_time, last_day = [], "", None
+    for pos, item in enumerate(items):
+        if int(item["day"]) != last_day:
+            last_day, last_time = int(item["day"]), ""
+        shown = normalize_time(item.get("depart_time"))
+        last_time = shown or last_time
+        key = schedule_sort_key({**item, "depart_time": last_time}) if last_time else schedule_sort_key(item)
+        keyed.append((key, pos, item))
+    return [item for _, _, item in sorted(keyed, key=lambda t: (t[0], t[1]))]
+
+
 def schedule_sort_key(item: ItineraryItem) -> tuple:
     """일정 정렬 키: (일차, 시간대, 시작 시각). 저녁 시간대의 06:00 전 시각은 자정을 넘긴 것이라 같은 시간대의 뒤로 보낸다.
 
@@ -723,6 +864,8 @@ def budget_usage_line(plan_type: str, items: list[ItineraryItem], budget_krw: in
     line = f"{pct_text} 사용, {tail}"
     if plan_type == "가성비형":
         line += ", 목표 80% 이내" if result["within"] else ", 목표 80% 초과"
+    if is_unreachable(plan_type, items, budget_krw):
+        line += f" (항공·숙박 등 줄일 수 없는 비용만 {_won(fixed_cost(items))}, 이 예산으로는 맞추기 어렵습니다)"
     return line
 
 
@@ -900,6 +1043,8 @@ def render_plain_answer(
     lines = [f"선택한 안: {selected}", _summary_line(selected, chosen, budget)]
     if not check_budget(selected, chosen, budget)["within"]:
         lines.append("경고: 예산을 충족하지 못한 안 중 가장 근접한 안입니다.")
+        if is_unreachable(selected, chosen, budget):
+            lines.append(f"항공·숙박 등 줄일 수 없는 비용만 {_won(fixed_cost(chosen))}라 이 예산으로는 맞추기 어렵습니다. 예산을 늘리거나 일정·인원을 조정해 주세요.")
     lines.append("수정하고 싶은 부분을 말씀해 주세요. 종료하려면 '종료'를 보내세요.")
     return "\n".join(lines)
 
@@ -1050,6 +1195,7 @@ def render_report_html(
     start_date: date | None = None,
     fx: dict | None = None,
     weather: dict | None = None,
+    destination: str | None = None,
 ) -> str:
     """선택 안의 3탭 HTML 리포트(일정표 / 맛집·명소 가이드북 / 준비물·유의 사항)를 만든다. 탭은 CSS만으로 전환한다.
 
@@ -1068,13 +1214,13 @@ def render_report_html(
     rows = "".join(
         "<tr>"
         f"<td>{date_cell(i)}</td><td>{int(i['day'])}일차</td><td>{normalize_time(i.get('depart_time'))}</td>"
-        f"<td>{normalize_time(i.get('arrive_time'))}</td><td>{escape(str(i['time_slot']))}</td>"
+        f"<td>{normalize_time(i.get('arrive_time'), end=True)}</td><td>{escape(str(i['time_slot']))}</td>"
         f"<td>{escape(str(i['activity']))}</td>"
         f"<td>{escape(str(i.get('origin', '')))}</td><td>{escape(str(i.get('arrival', '')))}</td>"
         f"<td>{escape(_cost_cell(i, people))}</td>"
         f"<td>{escape(str(i['transport']))}</td><td>{escape(str(i.get('duration', '')))}</td><td>{escape(str(i['note']))}</td>"
         "</tr>"
-        for i in sorted(items, key=schedule_sort_key)
+        for i in ordered_schedule(items)
     )
     warning = ""
     if not result["within"]:
@@ -1082,6 +1228,11 @@ def render_report_html(
             f"<p class='warning'>경고: 예산 미충족 — 목표 {_won(target)}를 {_won(result['overage'])} 초과했습니다. "
             "재조정 후에도 맞추지 못한 안 중 가장 근접한 안입니다.</p>"
         )
+        if is_unreachable(plan_type, items, budget_krw):
+            warning = (
+                f"<p class='warning'>경고: 예산 미충족 — 항공·숙박 등 줄일 수 없는 비용만 {_won(fixed_cost(items))}라 "
+                f"목표 {_won(target)}로는 맞출 수 없습니다. 예산을 늘리거나 일정·인원을 조정해 주세요.</p>"
+            )
     tiles = f"<div class='stat main'><span class='k'>합계</span><span class='v'>비용 합계: {_won(result['total'])}</span></div>"
     bar = ""
     if budget_krw is None:
@@ -1100,6 +1251,7 @@ def render_report_html(
     chips = "".join(
         f"<span class='chip'>{escape(text)}</span>"
         for text in (
+            f"여행지: {destination}" if destination else "",
             f"출발지: {origin_text}" if origin_text else "",
             f"조회 기준 날짜: {period_text}" if period_text else "",
             f"여행 인원: {people}명" if people else "",

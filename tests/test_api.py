@@ -387,3 +387,30 @@ def test_inline_images_logic_runs_in_node_with_mock_fetch():
 
     result = json.loads(out.stdout.strip().splitlines()[-1])
     assert result == {"calls": 3, "failed": 2, "total": 3, "embedded": 2, "badKept": True, "txtKept": True, "svgKept": True, "lazyLeft": False}
+
+
+def test_parse_trip_country_and_city_and_route_origin():
+    """'중국 장가계'처럼 나라가 앞에 붙어도 도시를 여행지로 읽고, 날짜 앞뒤·사이의 군더더기 단어를 건너뛰며, 나라가 낀 경로의 출발지도 읽는다."""
+    cases = {
+        "중국 장가계로 11월 8일부터 11일까지 2명 예산 100만원": ("장가계", None),
+        "중국 장가계 여행 11/8~11/11 2명 100만원": ("장가계", None),
+        "11월 8일부터 11일까지 중국 장가계 2명 100만원": ("장가계", None),
+        "서울에서 중국 장가계로 3박4일 2명 100만원": ("장가계", "서울"),
+        "여수에서 중국 장가계로 3박4일 2명": ("장가계", "여수"),
+        "중국 3박4일 2명": ("중국", None),  # 도시가 없으면 나라
+    }
+    for question, (destination, origin) in cases.items():
+        parsed = parse_trip(question)
+        assert (parsed["destination"], parsed["origin"]) == (destination, origin), question
+
+
+def test_restated_trip_does_not_inherit_previous_destination():
+    """정보 부족으로 이어 가던 세션에서 기간을 다시 말하며 새 여행을 시작하면 이전 여행지(여수)를 물려받지 않고 여행지를 되묻는다."""
+    client = make_client()
+    err = _err(client.post("/query", json={"question": "여수 3박4일 100만원"}))
+    assert err["missing"] == ["인원"]
+    r = client.post("/query", json={"question": "11/8~11/11 2명 갈 거야", "session_id": err["session_id"]})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "missing_fields" and "여행지" in r.json()["error"]["missing"]
+    r = client.post("/query", json={"question": "중국 장가계 여행 11/8~11/11 2명", "session_id": err["session_id"]})
+    assert r.status_code == 200 and "장가계" in r.json()["answer"]["plainAnswer"] and "여수" not in r.json()["answer"]["plainAnswer"]

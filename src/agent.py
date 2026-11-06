@@ -21,10 +21,13 @@ from src.tools import (
     apply_domestic_routes,
     check_budget,
     clip_note,
+    carry_over_times,
     closest_attempt,
     difference_ok,
     fallback_difference,
     final_items,
+    fixed_cost,
+    is_unreachable,
     finalize_items,
     fit_difference,
     needs_readjust,
@@ -740,6 +743,9 @@ def build_graph(model: Any | None = None, checkpointer: Any | None = None, maps:
             for pt, plan in plans.items()
             if needs_readjust(pt, plan["attempts"], budget)
         ]
+        for pt, plan in plans.items():
+            if budget is not None and not check_budget(pt, plan["attempts"][-1], budget)["within"] and is_unreachable(pt, plan["attempts"][-1], budget):
+                logger.info("%s 안은 줄일 수 없는 비용 %d원이 목표 %d원을 넘어 재조정을 건너뜁니다", pt, fixed_cost(plan["attempts"][-1]), target_budget(pt, budget))
         if sends:
             return sends
         exhausted = any(not check_budget(pt, p["attempts"][-1], budget)["within"] for pt, p in plans.items())
@@ -750,6 +756,7 @@ def build_graph(model: Any | None = None, checkpointer: Any | None = None, maps:
         trip, plan_type, attempts = payload["trip"], payload["plan_type"], payload["attempts"]
         last = attempts[-1]
         res = check_budget(plan_type, last, trip.get("budget_krw"))
+        logger.info("%s 재조정 %d회차: 합계 %d원, 초과 %d원, 줄일 수 없는 비용 %d원", plan_type, len(attempts), res["total"], res["overage"], fixed_cost(last))
         prompt = (
             f"{trip['destination']} {trip['days']}일, {trip['people']}명 {plan_type} 일정의 합계 {res['total']}원이 목표 "
             f"{target_budget(plan_type, trip.get('budget_krw'))}원을 {res['overage']}원 초과했습니다. "
@@ -757,10 +764,11 @@ def build_graph(model: Any | None = None, checkpointer: Any | None = None, maps:
             "숙박 항목은 unit_cost_krw(객실 1박 요금)를 쓰세요(인원수·객실 수·박 수는 코드가 곱합니다). "
             "가격을 비현실적으로 낮추거나 0원으로 쓰지 마세요. 최소 단가보다 낮은 금액은 코드가 올립니다. "
             f"비용이 큰 항목: {_top_cost_text(last)}. 이런 항목부터 검토하세요. "
-            f"{NOTE_RULE}{CATEGORY_RULE}\n{_items_text(last, trip['people'])}"
+            f"{TIME_RULE}{NOTE_RULE}{CATEGORY_RULE}\n{_items_text(last, trip['people'])}"
         )
         items, errors = _call_structured(llm, prompt)
         if items is not None:
+            items = carry_over_times(items, last)  # 모델이 빠뜨린 시각은 직전 시도 값을 이어받는다
             items = finalize_items(items, trip["people"], trip["days"], payload.get("fx"), payload.get("place_stats"), payload.get("price_quotes"), plan_type)
         if items is None:
             # 실패한 재조정도 한 번의 시도로 센다(같은 안을 남겨 무한 루프를 막는다)
@@ -969,13 +977,14 @@ def build_graph(model: Any | None = None, checkpointer: Any | None = None, maps:
                 "입장권·식사·항공권 같은 1인 단위 비용은 per_person=true 와 unit_cost_krw(1인 가격)로, 숙박 체크인 항목은 unit_cost_krw(객실 1박 요금)로 쓰세요"
                 "(인원수·객실 수·박 수는 코드가 곱합니다). 0원으로 낮추지 마세요. "
                 "각 항목의 category(식당/명소/이동/숙박/기타)도 유지하세요. "
-                f"비고(note)는 {NOTE_MAX_CHARS}자 이내로 짧게 쓰세요. 합계나 예산 판단은 말하지 마세요."
+                f"{TIME_RULE}비고(note)는 {NOTE_MAX_CHARS}자 이내로 짧게 쓰세요. 합계나 예산 판단은 말하지 마세요."
             ),
         )
         request = state["chat_history"][-1].content if state.get("chat_history") else ""
         agent.invoke({"messages": [HumanMessage(content=str(request))]})
         submitted = holder["submitted"]
         if submitted:
+            submitted = carry_over_times(submitted, current)  # 모델이 빠뜨린 시각은 수정 전 값을 이어받는다
             submitted = finalize_items(submitted, state["trip"].get("people"), state["trip"].get("days"), state.get("fx"), state.get("place_stats"), state.get("price_quotes"), state.get("selected"))
         update: dict = {"trace": ["chat_edit"]}
         if submitted:
@@ -1021,10 +1030,11 @@ def build_graph(model: Any | None = None, checkpointer: Any | None = None, maps:
             "숙박 항목은 unit_cost_krw(객실 1박 요금)를 쓰세요(인원수·객실 수·박 수는 코드가 곱합니다). "
             "가격을 비현실적으로 낮추거나 0원으로 쓰지 마세요. 최소 단가보다 낮은 금액은 코드가 올립니다. "
             f"비용이 큰 항목: {_top_cost_text(last)}. 이런 항목부터 검토하세요. "
-            f"{NOTE_RULE}{CATEGORY_RULE}\n{_items_text(last, trip['people'])}"
+            f"{TIME_RULE}{NOTE_RULE}{CATEGORY_RULE}\n{_items_text(last, trip['people'])}"
         )
         items, errors = _call_structured(llm, prompt)
         if items is not None:
+            items = carry_over_times(items, last)  # 모델이 빠뜨린 시각은 직전 시도 값을 이어받는다
             items = finalize_items(items, trip["people"], trip["days"], state.get("fx"), state.get("place_stats"), state.get("price_quotes"), state.get("selected"))
         return {
             "trace": ["readjust_selected"],
@@ -1112,6 +1122,6 @@ def build_answer(state: dict) -> dict:
         "html": render_report_html(
             selected, items, trip.get("budget_krw"), state.get("guide"), state.get("price_research"),
             trip.get("people"), origin_text, period_label(trip), trip_dates(trip)[0],
-            state.get("fx"), state.get("weather"),
+            state.get("fx"), state.get("weather"), trip.get("destination"),
         ),
     }

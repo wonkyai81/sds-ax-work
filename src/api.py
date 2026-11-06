@@ -17,7 +17,7 @@ from langgraph.types import Command
 from pydantic import BaseModel
 
 from src.agent import PLAN_TYPES, build_answer, build_graph
-from src.tools import CONFLICT_NOTICE, classify_request, has_conflict, merge_trip
+from src.tools import CONFLICT_NOTICE, classify_request, has_conflict, merge_trip, restates_trip
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -63,6 +63,14 @@ def parse_people(question: str) -> int | None:
 
 
 _PLACE = r"[가-힣A-Za-z]+"
+_COUNTRIES = (
+    "중국", "일본", "미국", "영국", "프랑스", "이탈리아", "스페인", "독일", "태국", "베트남", "대만", "홍콩", "싱가포르", "필리핀",
+    "인도네시아", "말레이시아", "호주", "캐나다", "튀르키예", "터키", "스위스", "체코", "오스트리아", "포르투갈", "그리스", "이집트",
+    "인도", "몽골", "라오스", "캄보디아", "뉴질랜드", "멕시코", "러시아", "네덜란드", "헝가리", "크로아티아", "노르웨이", "핀란드",
+)  # '중국 장가계'처럼 나라 이름이 앞에 붙으면 도시를 여행지로 본다
+_COUNTRY_RE = "|".join(_COUNTRIES)
+_FILLER = {"여행", "가족여행", "해외여행", "국내여행", "일정", "계획", "여행지"}  # 여행지와 날짜 사이에 끼어도 되는 말
+_NOT_PLACE = _STOPWORDS | {"가족여행", "해외여행", "국내여행", "여행지", "가족", "친구", "예정", "예정이야", "예정이에요", "이번", "다음", "내일", "올해"}
 
 
 _DATE_A = re.compile(r"(\d{4})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})\s*일?")  # 2026-12-20, 2026.12.20, 2026년 12월 20일
@@ -144,12 +152,56 @@ def parse_route(question: str) -> tuple[str | None, str | None]:
     m = re.search(rf"({_PLACE})\s*(?:->|→|➡|➜)\s*({_PLACE})", question)
     if not m:
         m = re.search(rf"({_PLACE})에서\s*({_PLACE}?)(?:으로|로|까지|행)(?![가-힣])", question)
+    if not m:  # 'A에서 중국 장가계로' 처럼 나라 이름이 끼면 나라 뒤의 도시를 목적지로 본다
+        m = re.search(rf"({_PLACE})에서\s+(?:{_COUNTRY_RE})\s+({_PLACE}?)(?:으로|로|까지|행)(?![가-힣])", question)
     if m and m.group(1) not in _STOPWORDS:
         return m.group(1), m.group(2)
     m = re.search(rf"({_PLACE}?)(?:에서)?\s*출발", question)
     if m and m.group(1) and m.group(1) not in _STOPWORDS:
         return m.group(1), None
     return None, None
+
+
+def _place_token(raw: str) -> str:
+    """토큰에서 구두점과 목적지 뒤 조사('로', '에서')를 떼고, 목적지로 쓸 수 있는 이름이면 돌려준다. 아니면 빈 문자열."""
+    token = raw.strip(".,!?")
+    if re.search(r"[가-힣]{2,}로$", token) and not token.endswith("으로"):
+        token = token[:-1]  # '도쿄로' 처럼 목적지 뒤에 붙은 조사 제거
+    elif re.search(r"[가-힣]{2,}에서$", token):
+        token = token[:-2]  # '제주에서 3박 4일' 은 제주에서 머무는 여행(목적지)으로 본다
+    if re.fullmatch(r"[A-Za-z가-힣]+", token) and token not in _NOT_PLACE and not re.search(r"(으로|해서)$", token):
+        return token
+    return ""
+
+
+def _pick_destination(question: str, anchor: int | None) -> str:
+    """기간·날짜 표기(anchor) 근처에서 여행지를 고른다. 앞쪽은 가까운 토큰부터 3개, 앞에서 못 찾으면 날짜 표기 뒤 2개를 본다.
+
+    '중국 장가계'처럼 나라 이름이 먼저 잡히면 옆의 도시 이름을 여행지로 쓴다(도시가 없으면 나라).
+    """
+    if anchor is None:
+        return ""
+    tokens_before = [t for t in re.split(r"[\s,]+", question[:anchor].strip(" ,")) if t and t != _DATE_MARK]
+    mark = question.find(_DATE_MARK)
+    tokens_after = []
+    if mark >= 0:  # '12월 20일부터 23일까지 도쿄 2명' 처럼 날짜 뒤에 목적지가 오는 경우
+        tokens_after = [t for t in re.split(r"[\s,]+", question[mark + len(_DATE_MARK):].strip(" ,")) if t][:2]
+    ordered = [[(t, tokens_before, k) for k, t in reversed(list(enumerate(tokens_before)))][:3], [(t, tokens_after, k) for k, t in enumerate(tokens_after)]]
+    for candidates in ordered:
+        for raw, group, k in candidates:
+            if raw.strip(".,!?") in _FILLER:  # '장가계 여행 11/8~' 처럼 사이에 낀 군더더기 단어는 건너뛴다
+                continue
+            token = _place_token(raw)
+            if not token:  # '정확한' 같은 수식어를 만나면 그 쪽에서는 더 찾지 않는다
+                break
+            if token in _COUNTRIES:
+                for j in (k + 1, k - 1):  # 나라 이름 옆의 도시
+                    if 0 <= j < len(group):
+                        city = _place_token(group[j])
+                        if city and city not in _COUNTRIES:
+                            return city
+            return token
+    return ""
 
 
 def parse_trip(question: str) -> dict:
@@ -182,22 +234,8 @@ def parse_trip(question: str) -> dict:
         anchor = question.find(_DATE_MARK)
     origin, route_dest = parse_route(question)
     destination = route_dest or ""
-    if not destination and anchor is not None:
-        before = [t for t in re.split(r"[\s,]+", question[:anchor].strip(" ,")) if t != _DATE_MARK]
-        token = before[-1].strip(".,!?") if before else ""
-        if re.search(r"[가-힣]{2,}로$", token) and not token.endswith("으로"):
-            token = token[:-1]  # '도쿄로' 처럼 목적지 뒤에 붙은 조사 제거
-        elif re.search(r"[가-힣]{2,}에서$", token):
-            token = token[:-2]  # '제주에서 3박 4일' 은 제주에서 머무는 여행(목적지)으로 본다
-        if re.fullmatch(r"[A-Za-z가-힣]+", token or "") and token not in _STOPWORDS and not re.search(r"(으로|해서)$", token):
-            destination = token
-    if not destination and _DATE_MARK in question:  # '12월 20일부터 23일까지 도쿄 2명' 처럼 날짜 뒤에 목적지가 오는 경우
-        after = [t for t in re.split(r"[\s,]+", question[question.find(_DATE_MARK) + len(_DATE_MARK):].strip(" ,")) if t]
-        token = after[0].strip(".,!?") if after else ""
-        if re.search(r"[가-힣]{2,}로$", token) and not token.endswith("으로"):
-            token = token[:-1]
-        if re.fullmatch(r"[A-Za-z가-힣]+", token or "") and token not in _STOPWORDS and not re.search(r"(으로|해서)$", token):
-            destination = token
+    if not destination:
+        destination = _pick_destination(question, anchor)
     return {
         "destination": destination, "days": days, "people": parse_people(question),
         "budget_krw": budget, "origin": origin, "start_date": start_date.isoformat() if start_date else None,
@@ -296,7 +334,11 @@ def create_app(graph: Any | None = None) -> FastAPI:
         new_trip = body.session_id is None or body.session_id in known_trips
         trip = None
         if new_trip:
-            trip = merge_trip(known_trips.get(body.session_id), parse_trip(question))
+            parsed = parse_trip(question)
+            known = known_trips.get(body.session_id)
+            if restates_trip(known, parsed):  # 이미 알던 기간·날짜를 다시 말하면 새 요청이다(이전 여행지를 물려받지 않는다)
+                known = None
+            trip = merge_trip(known, parsed)
         verdict = classify_request(question, trip, new_trip)
         if verdict:
             extra = {}

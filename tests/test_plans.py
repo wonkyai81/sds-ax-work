@@ -137,7 +137,8 @@ def test_select_chat_and_done_flow():
     result = graph.invoke(Command(resume={"type": "select", "plan": "맛집형"}), config)
     assert result["selected"] == "맛집형" and "__interrupt__" in result
     result = graph.invoke(Command(resume={"type": "chat", "text": "첫 아침을 바꿔줘"}), config)
-    assert result["selected_items"] == new_items
+    strip = lambda i: {k: v for k, v in i.items() if k not in ("depart_time", "arrive_time")}  # 시각은 비어 있으면 코드가 채운다
+    assert [strip(i) for i in result["selected_items"]] == [strip(i) for i in new_items]
     assert "chat_edit" in result["trace"] and "check_budget_selected" in result["trace"]
     graph.invoke(Command(resume={"type": "done"}), config)
     assert not graph.get_state(config).next
@@ -1175,7 +1176,8 @@ def test_zero_cost_plan_cannot_meet_tiny_budget_and_ends_with_closest_attempt():
     trip = {"destination": "제주", "days": 2, "people": 2, "budget_krw": 10_000}
     graph = build_graph(FakeModel(planner=zero_plan))
     result = graph.invoke({"trip": trip}, {"configurable": {"thread_id": "zero"}})
-    assert "pick_closest" in result["trace"] and result["trace"].count("readjust_plan") == 9  # 안마다 재조정 3회
+    # 최소 단가로 확정된 비용만으로 이미 목표를 넘으므로 재조정을 반복하지 않고 바로 근접 안을 고른다
+    assert "pick_closest" in result["trace"] and result["trace"].count("readjust_plan") == 0
     for plan_type, plan in result["plans"].items():
         last = plan["attempts"][-1]
         assert sum(i["cost_krw"] for i in last) == 30_000 + 3_000 * 2  # 숙박 최소 1실 x 1박 + 식사 최소 1인 x 2명

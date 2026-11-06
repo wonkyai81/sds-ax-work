@@ -214,3 +214,10 @@ def test_report_places_tab_shows_sight_image_with_credit_and_escapes():
     assert "이미지: 위키백과 「센소지 &lt;b&gt;」" in tab2 and "<b>" not in tab2.split("figcaption")[1]  # 출처 문구도 이스케이프
     assert "evil.example.com" not in html and "이치란" in tab2
     assert tab2.split("<h3>명소</h3>")[0].count("<img ") == 0  # 맛집 카드에는 기본 이미지도 넣지 않는다
+
+
+def test_report_shows_destination_chip():
+    """리포트 상단에 파싱된 여행지가 보여 잘못 읽었을 때 알아볼 수 있다."""
+    html = render_report_html("맛집형", [_item(1, "아침")], 100000, destination="장가계")
+    assert "여행지: 장가계" in html
+    assert "여행지:" not in render_report_html("맛집형", [_item(1, "아침")], 100000)

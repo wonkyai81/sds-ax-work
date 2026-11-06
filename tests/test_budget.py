@@ -179,7 +179,10 @@ def test_normalize_time_and_origin_defaults():
     from src.tools import normalize_time, origin_label, trip_origin
 
     assert [normalize_time(v) for v in ("9:05", "09:05", " 7:30 ", "23:59")] == ["09:05", "09:05", "07:30", "23:59"]
-    assert [normalize_time(v) for v in ("9:5", "abc", "", None, "24:00", "12:60", "<b>1:00</b>")] == [""] * 7
+    assert [normalize_time(v) for v in ("9:5", "abc", "", None, "12:60", "25:00", "<b>1:00</b>")] == [""] * 7
+    assert [normalize_time(v) for v in ("09:05:00", "9시", "9시 30분", "오전 9:00", "오후 3:20", "3:20 PM", "0900", "24:00")] == [
+        "09:05", "09:00", "09:30", "09:00", "15:20", "15:20", "09:00", "00:00"]
+    assert normalize_time("09:00~10:00") == "09:00" and normalize_time("09:00~10:00", end=True) == "10:00"
     assert trip_origin({}) == ("서울", True) and trip_origin({"origin": None}) == ("서울", True)
     assert trip_origin({"origin": "부산"}) == ("부산", False)
     assert origin_label({}) == "서울(기본값)" and origin_label({"origin": "부산"}) == "부산"
@@ -621,3 +624,69 @@ def test_flight_choice_prefers_direct_then_cheapest_and_value_plan_takes_cheapes
     assert price("맛집형") == 280_000 and price("명소형") == 280_000  # 직항 중 최저가
     assert price("가성비형") == 200_000  # 경유라도 최저가
     assert price("맛집형", note="B항공 희망") == 300_000  # 항목에 적힌 항공사가 후보에 있으면 그 항공사
+
+
+def test_unreachable_plan_skips_readjust_and_warns():
+    """줄일 수 없는 비용(조회 항공)만으로 목표를 넘으면 재조정하지 않고 안내 문구를 붙인다."""
+    from src.tools import budget_usage_line, fixed_cost, is_unreachable, needs_readjust
+
+    flight = {"day": 1, "time_slot": "아침", "activity": "항공", "cost_krw": 6_000_000, "transport": "비행기", "note": "왕복 대한항공 KE907"}
+    meal = {"day": 1, "time_slot": "저녁", "activity": "식사", "cost_krw": 100_000, "transport": "도보", "note": "현지식"}
+    items = [flight, meal]
+    assert fixed_cost(items) == 6_000_000
+    assert is_unreachable("맛집형", items, 5_000_000) is True
+    assert needs_readjust("맛집형", [items], 5_000_000) is False
+    assert "줄일 수 없는 비용" in budget_usage_line("맛집형", items, 5_000_000)
+    # 줄일 수 있는 비용이 초과의 원인이면 기존처럼 재조정한다
+    flight_ok = dict(flight, cost_krw=3_000_000)
+    meal_big = dict(meal, cost_krw=3_000_000)
+    assert needs_readjust("맛집형", [[flight_ok, meal_big]], 5_000_000) is True
+
+
+def _timed(day, slot, activity, depart="", arrive="", category=""):
+    return {"day": day, "time_slot": slot, "activity": activity, "cost_krw": 0, "transport": "도보", "note": "",
+            "depart_time": depart, "arrive_time": arrive, "category": category}
+
+
+def test_fill_missing_times_keeps_existing_and_fills_blank_in_order():
+    """이동 항목 시각은 그대로 두고, 빈 활동 항목은 앞 항목 도착 시각 뒤로 채워 순서가 뒤집히지 않는다."""
+    from src.tools import fill_missing_times, ordered_schedule
+
+    items = [
+        _timed(4, "아침", "호텔→공항 이동", "08:15", "09:05"),
+        _timed(4, "아침", "호텔 근처 아침식사", category="식당"),
+        _timed(4, "아침", "장가계→서울 귀국 항공", "11:10", "21:55"),
+    ]
+    filled = fill_missing_times(items)
+    assert (filled[0]["depart_time"], filled[0]["arrive_time"]) == ("08:15", "09:05")  # 있던 값은 그대로
+    assert (filled[2]["depart_time"], filled[2]["arrive_time"]) == ("11:10", "21:55")
+    assert (filled[1]["depart_time"], filled[1]["arrive_time"]) == ("09:05", "10:05")  # 식사 60분
+    assert items[1]["depart_time"] == ""  # 원본은 바뀌지 않는다
+    assert [i["activity"] for i in ordered_schedule(filled)] == ["호텔→공항 이동", "호텔 근처 아침식사", "장가계→서울 귀국 항공"]
+
+
+def test_fill_missing_times_caps_at_next_timed_item():
+    """뒤 항목의 출발 시각을 넘지 않게 끝 시각을 맞춘다."""
+    from src.tools import fill_missing_times
+
+    filled = fill_missing_times([_timed(1, "아침", "산책", "", ""), _timed(1, "아침", "이동", "08:30", "09:00")])
+    assert filled[0]["arrive_time"] <= "08:30" and filled[0]["depart_time"] < filled[0]["arrive_time"]
+
+
+def test_ordered_schedule_keeps_input_order_for_blank_times():
+    """시각이 끝내 비어 있는 항목은 맨 뒤로 가지 않고 앞 항목 바로 뒤에 온다."""
+    from src.tools import ordered_schedule
+
+    items = [_timed(1, "아침", "A", "09:00", "10:00"), _timed(1, "아침", "B"), _timed(1, "아침", "C", "11:00", "12:00")]
+    assert [i["activity"] for i in ordered_schedule(items)] == ["A", "B", "C"]
+
+
+def test_carry_over_times_fills_blank_from_previous_attempt():
+    """재조정·수정 결과에서 모델이 빠뜨린 시각은 직전 시도의 같은 항목 값을 이어받는다."""
+    from src.tools import carry_over_times
+
+    old = [_timed(1, "아침", "점심 식사", "12:00", "13:00")]
+    new = [_timed(1, "아침", "점심 식사"), _timed(1, "아침", "새 항목")]
+    result = carry_over_times(new, old)
+    assert (result[0]["depart_time"], result[0]["arrive_time"]) == ("12:00", "13:00")
+    assert result[1]["depart_time"] == ""
