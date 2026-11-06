@@ -40,7 +40,7 @@ def test_first_request_returns_three_keys_and_session_id():
     assert set(body["answer"]) == {"session_id", "plainAnswer", "html"}
     assert body["answer"]["session_id"] and body["answer"]["html"] == ""
     assert any(c["tool"] == "check_budget" for c in body["contexts"])
-    assert body["trace"][0] == "validate_request" and body["trace"][-1] == "collect_plans"
+    assert body["trace"][0] == "validate_request" and body["trace"][-1] == "compare_plans"
 
 
 def test_select_then_chat_then_done_resume_by_pending_interrupt():
@@ -264,3 +264,126 @@ def test_answer_shows_period_basis_for_input_and_default():
     assert "조회 기준 날짜: 2099-01-10 ~ 2099-01-12 (입력)" in plain
     plain = client.post("/query", json={"question": "도쿄 3박 4일 2명"}).json()["answer"]["plainAnswer"]
     assert "조회 기준 날짜:" in plain and "(입력이 없어 D+30 기본값)" in plain
+
+
+def test_first_response_keeps_contract_and_has_card_blocks():
+    """3안 응답은 answer 키 세 개를 유지하고, 첫 줄 형식은 그대로이며 안마다 새 블록이 붙는다."""
+    body = make_client().post("/query", json={"question": Q}).json()
+    assert set(body["answer"]) == {"session_id", "plainAnswer", "html"} and body["answer"]["html"] == ""
+    lines = body["answer"]["plainAnswer"].splitlines()
+    heads = [i for i, l in enumerate(lines) if l.startswith("- ")]
+    assert [lines[i].split(":")[0] for i in heads] == ["- 맛집형", "- 명소형", "- 가성비형"]
+    assert all(lines[i + 1].startswith("  예산 대비: ") and lines[i + 2].startswith("  차별점: ") and lines[i + 3] == "  주요 일정:" for i in heads)
+    from src.tools import difference_ok
+
+    assert all(difference_ok(lines[i + 2].removeprefix("  차별점: ")) for i in heads)  # 차별점은 2~3문장
+    assert "compare_plans" in body["trace"] and any(c["tool"] == "compare_plans" for c in body["contexts"])
+    # 선택 후 흐름과 plainAnswer 형식은 바뀌지 않는다
+    sid = body["answer"]["session_id"]
+    chosen = make_client()
+    sid = chosen.post("/query", json={"question": Q}).json()["answer"]["session_id"]
+    sel = chosen.post("/query", json={"question": "2번 안으로 할게", "session_id": sid}).json()
+    assert sel["answer"]["plainAnswer"].startswith("선택한 안: 명소형") and "차별점" not in sel["answer"]["plainAnswer"]
+
+
+def test_parse_selection_needs_explicit_marker_and_ignores_other_digits():
+    """'3안에서 …'는 3안 선택이지만, '2박'·'10만원' 같은 다른 숫자는 선택이 아니다. 숫자만 입력하면 선택으로 본다."""
+    assert parse_selection("3안에서 숙소를 변경해줘") == "가성비형"
+    assert parse_selection("1번") == "맛집형" and parse_selection("2") == "명소형"
+    assert parse_selection("숙소를 2박으로 바꿔줘") is None
+    assert parse_selection("숙소 예산을 10만원으로 변경해줘") is None
+    assert parse_selection("12안") is None
+
+
+def test_has_edit_request_detects_edit_expressions_only():
+    """수정 표현이 있으면 True, 선택만 있는 문장은 False."""
+    from src.api import has_edit_request
+
+    assert not has_edit_request("2번 안으로 할게") and not has_edit_request("가성비형으로") and not has_edit_request("2번 안으로 해줘")
+    assert has_edit_request("3안에서 숙소를 변경해줘") and has_edit_request("스시로 바꿔줘")
+
+
+def test_edit_request_before_selection_is_rejected_and_session_stays_selectable():
+    """안을 고르기 전의 수정 요청은 거절되고(422), 그래프는 진행되지 않으며, 이어서 안을 고르면 정상 진행된다."""
+    client = make_client()
+    sid = client.post("/query", json={"question": Q}).json()["answer"]["session_id"]
+    for text in ("3안에서 숙소를 변경해줘", "숙소를 바꿔줘", "2번 안으로 하고 저녁을 빼줘"):
+        r = client.post("/query", json={"question": text, "session_id": sid})
+        assert r.status_code == 422 and r.json()["error"]["code"] == "edit_before_selection"
+        assert set(r.json()["error"]) == {"code", "message"} and "선택한 뒤" in r.json()["error"]["message"]
+    ok = client.post("/query", json={"question": "3안으로 할게", "session_id": sid})
+    assert ok.status_code == 200 and "chat_edit" not in ok.json()["trace"] and "가성비형" in ok.json()["answer"]["html"]
+    after = client.post("/query", json={"question": "2일차 저녁을 스시로 바꿔줘", "session_id": sid})  # 선택 후에는 수정 가능
+    assert after.status_code == 200 and "chat_edit" in after.json()["trace"]
+
+
+def test_select_only_does_not_trigger_an_edit():
+    """선택만 보낸 요청은 수정 단계를 돌리지 않는다."""
+    client = make_client()
+    sid = client.post("/query", json={"question": Q}).json()["answer"]["session_id"]
+    body = client.post("/query", json={"question": "3안으로 할게", "session_id": sid}).json()
+    assert "chat_edit" not in body["trace"] and "가성비형" in body["answer"]["html"]
+
+
+def test_index_page_locks_free_text_input_until_a_plan_is_selected():
+    """웹 UI 는 안 선택 단계(select)에서 입력창과 보내기 버튼을 잠그고, 안 선택은 카드 버튼으로만 하게 한다."""
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'state.stage === "done" || state.stage === "select"' in html  # inputLocked: 대화 종료·안 선택 전
+    assert "$(\"prompt\").disabled = $(\"send\").disabled = inputLocked();" in html
+    assert "안을 선택하면 일정 수정 요청을 입력할 수 있습니다." in html
+    assert "if (!text && inputLocked()) return false;" in html  # 입력창 경로만 막고 카드 버튼(문장 직접 전달)은 허용
+
+
+def test_index_page_has_report_export_button_that_downloads_standalone_html():
+    """리포트 영역에 'HTML로 내보내기' 버튼이 있고, 최신 리포트를 doctype 이 있는 단독 HTML 파일로 내려받는다."""
+    page = make_client().get("/").text
+    report_section = page.split('<section id="report"')[1].split("</section>")[0]
+    assert 'id="exportHtml"' in report_section and "HTML로 내보내기" in report_section  # 리포트가 있을 때만 보이는 영역 안
+    assert "state.html = a.html" in page and "<!doctype html>" in page
+    assert "link.download = `travel-report-" in page and 'type: "text/html;charset=utf-8"' in page
+
+
+def test_index_export_embeds_report_images_into_the_file():
+    """내보내기는 리포트의 원격 이미지를 data URI 로 파일 안에 포함하고, 받지 못한 이미지가 있으면 사용자에게 알린다."""
+    page = make_client().get("/").text
+    assert "async function inlineImages(html, fetchFn" in page and "await inlineImages(state.html" in page
+    assert "이미지 포함하는 중…" in page and "파일에 포함하지 못해 원본 링크로 남겼습니다" in page
+
+
+def test_inline_images_logic_runs_in_node_with_mock_fetch():
+    """inlineImages 를 node 로 실제 실행한다(모의 fetch): 성공은 base64 로 바뀌고, 실패·비이미지 응답·기본 이미지·중복 주소를 올바르게 처리한다."""
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node 가 없어 건너뜁니다")
+    page = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    code = page.split("// <inline-images>")[1].split("// </inline-images>")[0]
+    check = code + r"""
+    (async () => {
+      const ok = "https://upload.wikimedia.org/a.jpg", bad = "https://upload.wikimedia.org/bad.jpg", txt = "https://upload.wikimedia.org/t.jpg";
+      const svg = "data:image/svg+xml;charset=utf-8,%3Csvg%3E";
+      const html = `<img src='${ok}' alt='a' loading='lazy'><img src='${ok}' alt='dup' loading='lazy'><img src='${bad}' alt='b'>` +
+                   `<img src='${txt}' alt='t'><img src='${svg}' alt='d'>`;
+      const calls = [];
+      const fetchFn = async (u) => {
+        calls.push(u);
+        if (u === ok) return { ok: true, headers: new Headers({ "content-type": "image/jpeg" }), arrayBuffer: async () => new Uint8Array([255, 216, 255]).buffer };
+        if (u === txt) return { ok: true, headers: new Headers({ "content-type": "text/html" }), arrayBuffer: async () => new ArrayBuffer(1) };
+        return { ok: false, status: 404, headers: new Headers() };
+      };
+      const r = await inlineImages(html, fetchFn);
+      console.log(JSON.stringify({ calls: calls.length, failed: r.failed, total: r.total,
+        embedded: (r.html.match(/src='data:image\/jpeg;base64,\/9j\/'/g) || []).length,
+        badKept: r.html.includes(bad), txtKept: r.html.includes(txt), svgKept: r.html.includes(svg), lazyLeft: r.html.includes("loading='lazy'") }));
+    })();
+    """
+    out = subprocess.run([node, "-e", check], capture_output=True, text=True, timeout=60, encoding="utf-8")
+    assert out.returncode == 0, out.stderr
+    import json
+
+    result = json.loads(out.stdout.strip().splitlines()[-1])
+    assert result == {"calls": 3, "failed": 2, "total": 3, "embedded": 2, "badKept": True, "txtKept": True, "svgKept": True, "lazyLeft": False}

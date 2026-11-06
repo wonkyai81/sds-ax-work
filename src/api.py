@@ -1,5 +1,6 @@
 """FastAPI 앱: POST /query 로 LangGraph 에이전트를 구동하고 interrupt 를 재개한다."""
 import json
+import logging
 import os
 import queue
 import re
@@ -17,6 +18,8 @@ from pydantic import BaseModel
 
 from src.agent import PLAN_TYPES, build_answer, build_graph
 from src.tools import CONFLICT_NOTICE, classify_request, has_conflict, merge_trip
+
+logger = logging.getLogger("uvicorn.error")
 
 WEB_INDEX = Path(__file__).resolve().parent.parent / "web" / "index.html"
 DONE_WORDS = {"종료", "끝", "그만", "완료", "done", "끝내기", "종료할게", "끝낼게"}
@@ -201,15 +204,26 @@ def parse_trip(question: str) -> dict:
     }
 
 
+EDIT_RE = re.compile(r"변경|바꿔|바꾸|수정|교체|추가|빼|제외|줄여|늘려|낮춰|올려|대신|말고")  # 선택과 함께 온 수정 요청 표현
+
+
 def parse_selection(question: str) -> str | None:
-    """'2번 안', '가성비형' 같은 문장에서 안 종류를 고른다. 모르면 None."""
-    m = re.search(r"([1-3])\s*(?:번|안)?", question)
-    if m and not re.search(r"\d{2,}", question):
+    """'2번 안', '3안에서', '가성비형' 같은 문장에서 안 종류를 고른다. 모르면 None.
+
+    숫자는 '번'·'안'이 붙었거나 숫자만 입력한 경우에만 선택으로 본다('숙소를 2박으로'의 2는 선택이 아니다).
+    """
+    m = re.search(r"(?<!\d)([1-3])\s*(?:번|안)(?!\d)", question) or re.fullmatch(r"\s*([1-3])\s*", question)
+    if m:
         return PLAN_TYPES[int(m.group(1)) - 1]
     for pt in PLAN_TYPES:
         if pt[:-1] in question:
             return pt
     return None
+
+
+def has_edit_request(question: str) -> bool:
+    """문장에 일정 수정 요청 표현('3안에서 숙소를 변경해줘')이 있으면 True. 안을 고르기 전에는 수정 요청을 받지 않는 데 쓴다."""
+    return bool(EDIT_RE.search(question))
 
 
 def _pending_stage(snapshot: Any) -> str | None:
@@ -223,6 +237,9 @@ def _pending_stage(snapshot: Any) -> str | None:
 
 def _run_config(session_id: str) -> dict:
     """그래프 실행 설정을 만든다. thread_id 는 session_id, LANGFUSE_* 환경변수가 있으면 Langfuse 추적 콜백을 붙인다."""
+    from src.config import export_aws_credentials
+
+    export_aws_credentials()
     config: dict = {"configurable": {"thread_id": session_id}}
     if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
         from langfuse.langchain import CallbackHandler
@@ -256,7 +273,8 @@ def create_app(graph: Any | None = None) -> FastAPI:
 
     @app.exception_handler(Exception)
     async def _unexpected(request: Request, exc: Exception):
-        """예상 못 한 오류는 500."""
+        """예상 못 한 오류는 500. 원인 파악을 위해 스택 트레이스를 로그에 남긴다."""
+        logger.error("처리되지 않은 예외: %s %s", request.method, request.url.path, exc_info=exc)
         return error_response(500, "internal_error", "서버 내부 오류가 발생했습니다")
 
     def run(g: Any, graph_input: Any, config: dict, on_step: Any) -> None:
@@ -301,6 +319,11 @@ def create_app(graph: Any | None = None) -> FastAPI:
                 raise ApiError(404, "session_not_found", "알 수 없는 session_id 입니다")
             stage = _pending_stage(snapshot)
             if stage == "select":
+                if has_edit_request(question):  # 안을 고르기 전에는 수정 요청을 받지 않는다(안 선택 후 대화로만 수정)
+                    raise ApiError(
+                        422, "edit_before_selection",
+                        "수정 요청은 안을 선택한 뒤에 할 수 있습니다. 먼저 맛집형·명소형·가성비형 중 하나(1~3번)를 골라 주세요",
+                    )
                 plan = parse_selection(question)
                 if plan is None:
                     raise ApiError(422, "invalid_selection", "맛집형·명소형·가성비형 중 하나(1~3번)를 골라 주세요")
@@ -334,6 +357,7 @@ def create_app(graph: Any | None = None) -> FastAPI:
             except ApiError as exc:
                 events.put({"error": {"code": exc.code, "message": exc.message, **exc.extra}, "status": exc.status})
             except Exception:
+                logger.exception("스트림 처리 중 예외: POST /query/stream")
                 events.put({"error": {"code": "internal_error", "message": "서버 내부 오류가 발생했습니다"}, "status": 500})
             events.put(None)
 

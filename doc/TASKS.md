@@ -17,7 +17,7 @@
 |---|---|---|---|---|---|
 | A1 | 의존성 목록과 `.env` 예시, `.gitignore` 작성 (`승인 필요`) | `requirements.txt`, `.env.example`, `.gitignore` | LangChain, LangGraph, langchain-aws, FastAPI, Streamlit, pytest 포함. `.env` 는 git 제외 | 30m | - |
 | A2 | 설정 로더 구현 | `src/config.py`, `tests/test_config.py` | `AWS_DEFAULT_REGION`, `BEDROCK_MODEL_ID` 를 `.env` 에서 읽음. 값이 코드에 없음. `pytest tests/test_config.py` 통과 (AC5) | 45m | A1 |
-| A3 | 도메인 타입 정의 (`TripRequest`, `ItineraryItem`, `PlanType`, `PlanState`) | `src/tools.py` 상단 | DESIGN 3절의 타입과 일치. `time_slot` 은 아침/오후/저녁 고정 | 30m | - |
+| A3 | 도메인 타입 정의 (`TripRequest`, `ItineraryItem`, `PlanType`, `PlanState`) | `src/tools.py` 상단 | DESIGN 3절의 타입과 일치(인원·출발지·시작일, 시각·1인 단가 선택 필드 포함). `time_slot` 은 아침/오후/저녁 고정 | 30m | - |
 
 ## 2. 결정적 도구 (B) — LLM 호출 없음
 
@@ -78,6 +78,8 @@
 | F3 | 12건 실행과 결과 기록 | `evaluation/` | 12건을 1회씩 실행해 자동 점검·PM 체크리스트 결과 기록 | 60m | E3, F1, F2 |
 | F4 | 실패 건 수정과 재평가 (여유 시간) | 해당 파일 | 12/12 통과 (PRD 합격선) | 60m | F3 |
 
+- 진행 현황: F1~F3 은 구현됨 (`evaluation/run_eval.py`, 회차별 `round*_report.md`, `eval_results_*.csv`, `eval_summary_*.json`). 가장 최근 5회차 자동 채점은 7/12 통과이고 실패 건은 500 오류와 도구 미호출입니다. F4(12/12)는 아직 완료되지 않았습니다.
+
 ## 6-2. Guardrail (G) — DESIGN 16절
 
 규칙 함수는 `src/tools.py`, 연결은 `src/api.py`, 테스트는 `tests/test_api.py` 에 둡니다. 새 파일은 만들지 않습니다.
@@ -89,6 +91,22 @@
 | G3 | 조건 충돌 감지 규칙 | `src/tools.py`, `tests/test_api.py` | TQ-10 입력에서 충돌을 감지. 충돌이 없는 입력은 오탐하지 않음 | 30m | G1 |
 | G4 | `/query` 에 Guardrail 연결: 422 코드, `known_trip` 서버 메모리, `session_id` 이어가기, 충돌 안내 | `src/api.py`, `tests/test_api.py` | 거절·누락은 `{"error": {"code", "message", ...}}` 422. 누락 응답에 `session_id`, `missing` 포함. 같은 `session_id` 로 보완 입력 시 그래프 시작. 충돌은 200 + 안내 | 60m | G2, G3 |
 | G5 | 여행지 파서 보정과 TQ-06~12 점검 테스트 | `src/api.py`, `tests/test_api.py` | '정확한' 등 수식어를 장소로 읽지 않음. 16절 대응표의 6개 시나리오가 기대한 코드·상태로 응답 | 45m | G4 |
+
+## 6-3. 확장 (H) — 구현 후 추가된 기능
+
+인터뷰 이후 구현 단계에서 추가된 기능입니다. 모두 구현되어 테스트가 통과합니다 (`python -m pytest tests -q`, 157개). 외부 연동(H3~H5, H7의 이미지)은 `MOCKDATA_USE=False` 일 때만 켜지고, 실패하면 LLM 추정으로 대체합니다. 새 파일은 만들지 않았습니다 (`web/index.html` 은 CLAUDE.md 고정 구조).
+
+| ID | 작업 | 파일 | 완료 기준 | 예상 | 선행 |
+|---|---|---|---|---|---|
+| H1 | 인원·출발지·날짜 파싱과 필수·선택 입력 | `src/api.py`, `src/tools.py`, `tests/test_api.py` | `parse_people`, `parse_route`, `parse_dates` 가 인원·구간·날짜를 규칙으로 읽음. 필수는 여행지·기간·인원, 예산·출발지(기본 서울)·날짜(기본 D+30)는 선택 | 45m | G5 |
+| H2 | 인원 비용 계산과 예산 선택 | `src/tools.py`, `src/agent.py`, `tests/test_budget.py` | `apply_headcount` 가 1인 단위 항목을 `1인 가격 × 인원` 으로 계산. 숙박은 2명당 1실 올림, 1일 여행은 숙박 없음. 예산이 없으면 `check_budget` 이 항상 충족 | 60m | B2, H1 |
+| H3 | 환율·날씨 Tool과 `research_conditions` | `src/tools.py`, `src/agent.py`, `tests/test_plans.py` | `get_exchange_rate`, `get_weather_forecast` 가 실패 시 `{"error": …}`. 노드가 해외 여부·통화·날씨 검색어를 정해 호출하고 프롬프트에 반영 | 60m | C4, A2 |
+| H4 | MCP 연결과 `research_places`, `research_prices` | `src/tools.py`, `src/agent.py`, `src/config.py`, `tests/test_plans.py` | Google Maps·마이리얼트립 MCP 로 장소(평점·리뷰 수)와 가격을 조회. 키·연결 실패 시 해당 노드만 건너뛰고 진행 | 60m | H3 |
+| H5 | 경로 조회 (`lookup_routes`, `lookup_domestic_routes`) | `src/tools.py`, `src/agent.py`, `tests/test_plans.py` | 해외는 Google Maps, 국내는 네이버로 구간·소요시간·통행료를 채움. 비용·시각 등 원래 값은 유지. 가이드와 병렬 실행 | 60m | H4, C13 |
+| H6 | `compare_plans` 와 3안 카드 정보 | `src/tools.py`, `src/agent.py`, `tests/test_budget.py` | 차별점 2~3문장·250자 이내(코드 검사, 폴백 문장). `budget_usage_line`, `main_schedule`(식당은 평점 4.5 이상·리뷰 5,000개 이상일 때 최대 1개)이 `plainAnswer` 에 포함 | 60m | C8, H4 |
+| H7 | `generate_guide`, 위키백과 이미지, 3탭 리포트 | `src/tools.py`, `src/agent.py`, `tests/test_report.py` | 일정표·가이드북·준비물·유의 사항 3탭. 날씨 요약 카드, 명소 대표 이미지(없으면 기본 이미지), 이미지 주소는 위키미디어 https 만 허용 | 60m | B6, H3 |
+| H8 | 웹 UI와 `POST /query/stream`, `GET /` | `web/index.html`, `src/api.py`, `tests/test_api.py` | NDJSON 진행 표시, 3안 카드 선택 버튼, 선택 전·종료 후 입력 잠금, 리포트 iframe 표시, "HTML로 내보내기"(이미지 포함) | 60m | D3, H6, H7 |
+| H9 | 선택 단계 규칙 | `src/api.py`, `tests/test_api.py` | `parse_selection`(`1번`·`3안`·숫자만·안 이름)과 수정 표현 거절(422 `edit_before_selection`), 못 읽으면 422 `invalid_selection`. 모르는·종료된 세션은 404 | 30m | D2 |
 
 ## 7. 의존 순서 요약
 
@@ -105,6 +123,10 @@ A2 ─ C2 ─┘                │
                                           D1 ─ D2 ─ D3 ─ D4 ─ F1 ─┐
                                                       E1 ─ E2 ─ E3 ─ F3 ─ F4
                                                                  F2 ─┘
+
+G5 ─ H1 ─ H2           H3 ─ H4 ─ H5
+          C4 ─ H3      C8 ─ H6 ─┐
+                       B6 ─ H7 ─┴─ H8   (D3 → H8, D2 → H9)
 ```
 
 ## 8. 작업량 요약
@@ -118,12 +140,13 @@ A2 ─ C2 ─┘                │
 | UI (E) | 3 | 2시간 15분 |
 | 평가 (F) | 4 | 3시간 45분 |
 | Guardrail (G) | 5 | 3시간 45분 |
-| **합계** | **42** | **약 32시간** |
+| 확장 (H) | 9 | 8시간 15분 |
+| **합계** | **51** | **약 40시간 15분** |
 
 ## 9. 사용자 확인이 필요한 항목
 
-1. **새 파일 허가**: `requirements.txt`, `.env.example`, `.gitignore` (A1), `evaluation/run_eval.py` (F1). 고정 구조에 없고 CLAUDE.md는 요청하지 않은 파일 생성을 금지합니다.
-2. **`data/` mock 데이터의 사용 방식**: SERVICE는 항목별 비용 샘플을 두라고 했지만, 코드에서 어떻게 쓸지(프롬프트 참고 자료인지, 테스트 입력인지)는 정해지지 않았습니다. B7은 형식과 사용 방식이 확정된 뒤 진행합니다.
+1. **새 파일 허가**: `requirements.txt`, `.env.example`, `.gitignore` (A1), `evaluation/run_eval.py` (F1). 고정 구조에 없고 CLAUDE.md는 요청하지 않은 파일 생성을 금지합니다. 현재 `requirements.txt`, `.gitignore`, `evaluation/run_eval.py` 는 만들어졌고 `.env.example` 은 없습니다.
+2. **`data/` mock 데이터의 사용 방식**: SERVICE는 항목별 비용 샘플을 두라고 했지만, 코드에서 어떻게 쓸지(프롬프트 참고 자료인지, 테스트 입력인지)는 정해지지 않았습니다. 그 사이 외부 조회(H3~H5)로 가격을 채우게 되어 `data/` 폴더는 만들지 않았고 B7은 보류 상태입니다.
 3. **도메인 타입 위치**: 순환 import를 피하려고 `src/tools.py` 상단(A3)에 두었습니다. `src/agent.py` 에 두면 `tools.py` 가 `agent.py` 를 가져와야 하므로 구조가 꼬입니다. 다른 위치를 원하면 알려주세요.
 4. **PRD 열린 항목**: 대화 수정 후 일수·필수 장소·예산 표시 유지 여부, 화면 언어(한국어만인지)는 아직 답이 없어 C14, E1~E3의 세부 기준이 바뀔 수 있습니다.
 5. **Seed**: 이 작업 목록 기준으로 `seed_ec1db24038dc` 를 재생성했습니다. 기존 `seed_ebc6e7d8804c` 는 대체되었습니다. 위 1~4번이 확정되면 필요에 따라 Seed를 다시 생성합니다.

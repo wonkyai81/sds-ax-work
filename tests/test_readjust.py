@@ -95,3 +95,16 @@ def test_selected_plan_chat_edit_gets_fresh_three_readjustments():
     assert len(state["selected_attempts"]) == 4  # 수정 1회마다 새로 3회
     assert result["trace"].count("readjust_selected") == 3
     assert "경고" in result["__interrupt__"][0].value["plainAnswer"]
+
+
+def test_readjust_prompt_points_at_most_expensive_items():
+    """재조정 프롬프트가 초과 금액과 함께 비용이 큰 항목을 짚어 준다."""
+    prompts = []
+
+    def planner(prompt):
+        prompts.append(prompt)
+        return make_output(150_000)
+
+    run(planner)
+    readjust = [p for p in prompts if "초과했습니다" in p]
+    assert readjust and all("비용이 큰 항목:" in p and "1-아침(150000원)" in p for p in readjust)

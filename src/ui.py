@@ -80,7 +80,11 @@ def main() -> None:
         st.caption("수정할 내용을 입력하거나 '종료'를 입력해 마칩니다.")
 
     if st.session_state["session_id"]:
-        prompt = st.chat_input("대화로 일정 수정 (예: 2일차 저녁을 스시로 바꿔줘)")
+        selected = bool(st.session_state["html"])  # 안을 고르기 전에는 수정 요청 입력을 잠근다
+        prompt = st.chat_input(
+            "대화로 일정 수정 (예: 2일차 저녁을 스시로 바꿔줘)" if selected else "안을 선택한 뒤에 수정 요청을 입력할 수 있습니다",
+            disabled=not selected,
+        )
         if prompt:
             send(prompt)
             st.rerun()

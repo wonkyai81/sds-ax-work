@@ -51,7 +51,10 @@ def test_no_hardcoded_values_or_user_keys():
     src = (ROOT / "src" / "config.py").read_text(encoding="utf-8")
     assert not re.search(r"us-east-1|anthropic\.claude", src)
     # 서버 환경변수로만 읽는 Google Maps MCP 키(GOOGLE_MAPS_API_KEY)는 허용하고, 그 밖의 키 항목은 없어야 한다
-    cleaned = re.sub(r"google_maps_api_key", "", src, flags=re.I)
+    # 네이버 지역검색·Directions 키(NAVER_LOCAL_API_KEY*, X_NCP_APIGW_API_KEY*)도 서버 환경변수로만 읽으므로 허용한다
+    # .env 의 AWS·Langfuse 값을 환경변수로 내보내는 이름 목록(AWS_ACCESS_KEY_ID 등)도 값이 아닌 이름이므로 허용한다
+    # OpenWeatherMap 키(OPENWEATHER_API_KEY)도 서버 환경변수로만 읽으므로 허용한다
+    cleaned = re.sub(r"AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|LANGFUSE_SECRET_KEY|google_maps_api_key|openweather_api_key|OPENWEATHER_API_KEY|NAVER_LOCAL_API_KEY(_ID)?|X_NCP_APIGW_API_KEY(_ID)?", "", src, flags=re.I)
     assert not re.search(r"ACCESS_KEY|SECRET|api_key", cleaned, re.I)
     assert set(config.Settings.__dataclass_fields__) == {"region", "model_id"}
 
@@ -86,3 +89,15 @@ def test_myrealtrip_url_default_and_override(tmp_path, monkeypatch):
     assert config.myrealtrip_mcp_url(env) == config.DEFAULT_MYREALTRIP_URL
     env.write_text("MYREALTRIP_MCP_URL=http://localhost:9/mcp\n", encoding="utf-8")
     assert config.myrealtrip_mcp_url(env) == "http://localhost:9/mcp"
+
+
+def test_openweather_key_required_when_missing(tmp_path, monkeypatch):
+    """날씨 키가 없으면 ConfigError, 있으면 환경변수가 .env 보다 우선해 읽힌다."""
+    monkeypatch.delenv("OPENWEATHER_API_KEY", raising=False)
+    env = tmp_path / ".env"
+    with pytest.raises(config.ConfigError):
+        config.openweather_api_key(env)
+    env.write_text("OPENWEATHER_API_KEY=from-file\n", encoding="utf-8")
+    assert config.openweather_api_key(env) == "from-file"
+    monkeypatch.setenv("OPENWEATHER_API_KEY", "from-env")
+    assert config.openweather_api_key(env) == "from-env"

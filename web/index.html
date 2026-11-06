@@ -8,13 +8,13 @@
 </head>
 <body class="bg-slate-50 text-slate-800 min-h-screen">
 <header class="border-b border-slate-200 bg-white">
-  <div class="mx-auto max-w-4xl px-6 py-4 flex items-center justify-between">
+  <div class="mx-auto max-w-[1680px] px-6 py-4 flex items-center justify-between">
     <h1 class="text-lg font-semibold tracking-tight">✈️ 여행 일정 에이전트</h1>
     <button id="reset" class="text-sm text-slate-500 hover:text-slate-800">새로 시작</button>
   </div>
 </header>
 
-<main class="mx-auto max-w-4xl px-6 py-8 space-y-6">
+<main class="mx-auto max-w-[1680px] px-6 py-8 space-y-6">
   <!-- 자연어 요청 입력 -->
   <section class="rounded-2xl bg-white shadow-sm border border-slate-200 p-5">
     <label for="prompt" id="promptLabel" class="block text-sm font-medium text-slate-600 mb-2">어디로, 며칠, 몇 명이 가시나요? (출발지·예산은 생략할 수 있어요)</label>
@@ -48,11 +48,14 @@
   <!-- 3안 -->
   <section id="plans" class="hidden">
     <h2 class="mb-3 text-sm font-semibold text-slate-600">추천 3안 — 하나를 골라 주세요</h2>
-    <div id="planCards" class="grid gap-3 sm:grid-cols-3"></div>
+    <div id="planCards" class="grid items-stretch gap-4 lg:grid-cols-3"></div>
   </section>
 
   <!-- 리포트 -->
   <section id="report" class="hidden rounded-2xl bg-white shadow-sm border border-slate-200 p-5">
+    <div class="mb-3 flex justify-end">
+      <button id="exportHtml" type="button" class="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">HTML로 내보내기</button>
+    </div>
     <div id="reportText" class="mb-3 text-sm text-slate-600 whitespace-pre-line"></div>
     <iframe id="reportFrame" title="여행 리포트" sandbox="" class="w-full rounded-xl border border-slate-200 bg-white" style="min-height:520px"></iframe>
   </section>
@@ -67,6 +70,7 @@ const LABELS = {
   readjust_plan: "예산 초과 안 재조정",
   pick_closest: "가장 근접한 안 선택",
   collect_plans: "3안 정리",
+  compare_plans: "안별 차이 비교",
   await_selection: "선택 대기",
   generate_guide: "맛집·명소 가이드와 유의 사항 생성",
   render_answer: "리포트 작성",
@@ -76,7 +80,7 @@ const LABELS = {
   readjust_selected: "수정 후 예산 재조정",
 };
 // 한 요청에서 지나가는 대표 단계 수(진행률 막대 추정용)
-const EXPECTED = { plans: 6, select: 3, chat: 4 };
+const EXPECTED = { plans: 7, select: 3, chat: 4 };
 
 const $ = (id) => document.getElementById(id);
 let state = { sessionId: null, stage: "new" }; // stage: new | select | chat | done
@@ -86,13 +90,18 @@ function setStage(stage) {
   state.stage = stage;
   const cfg = {
     new: ["어디로, 며칠, 몇 명이 가시나요? (출발지·예산은 생략할 수 있어요)", "예) 부산에서 도쿄로 3박 4일 2명, 예산 100만원 (출발지를 생략하면 서울, 예산은 생략 가능)"],
-    select: ["마음에 드는 안을 말씀해 주세요.", "예) 2번 안으로 할게 / 가성비형으로 할게"],
+    select: ["위의 안 카드에서 '이 안으로 선택'을 눌러 주세요. 수정 요청은 안을 선택한 뒤에 할 수 있어요.", "안을 선택하면 일정 수정 요청을 입력할 수 있습니다."],
     chat: ["고치고 싶은 부분을 말씀해 주세요.", "예) 2일차 저녁을 고급 스시 오마카세로 바꿔줘 (끝내려면 '종료')"],
     done: ["대화가 끝났습니다. 새로 시작하려면 위의 '새로 시작'을 누르세요.", ""],
   }[stage];
   $("promptLabel").textContent = cfg[0];
   $("prompt").placeholder = cfg[1];
-  $("prompt").disabled = $("send").disabled = stage === "done";
+  $("prompt").disabled = $("send").disabled = inputLocked();
+}
+
+// 입력창은 대화가 끝났거나(done) 안을 고르기 전(select)에는 잠근다. 안 선택은 카드의 버튼으로만 한다.
+function inputLocked() {
+  return state.stage === "done" || state.stage === "select";
 }
 
 function showNotice(text, kind) {
@@ -135,11 +144,13 @@ function endProgress(ok) {
 }
 
 async function send(text) {
+  if (!text && inputLocked()) return false; // 입력창으로 보내는 경우만 막는다(카드 버튼은 문장을 직접 넘긴다)
   text = (text || $("prompt").value).trim();
-  if (!text) return;
+  if (!text) return false;
   $("send").disabled = true;
   showNotice("");
   const kind = state.stage === "new" ? "plans" : state.stage === "select" ? "select" : "chat";
+  let ok = false;
   const p = startProgress(kind);
   const body = { question: text };
   if (state.sessionId) body.session_id = state.sessionId;
@@ -171,14 +182,16 @@ async function send(text) {
       endProgress(true);
       $("prompt").value = "";
       render(final.result);
+      ok = true;
       if (kind === "chat" && ["종료", "끝", "그만", "완료", "done"].includes(text.toLowerCase())) setStage("done");
     }
   } catch (e) {
     endProgress(false);
     showNotice("서버에 연결하지 못했습니다: " + e.message, "error");
   } finally {
-    if (state.stage !== "done") $("send").disabled = false;
+    $("send").disabled = inputLocked();
   }
+  return ok;
 }
 
 function render(data) {
@@ -188,6 +201,7 @@ function render(data) {
   $("plans").classList.toggle("hidden", hasReport);
   $("report").classList.toggle("hidden", !hasReport);
   if (hasReport) {
+    state.html = a.html; // 내보내기용: 수정 후 다시 그려질 때마다 최신 리포트로 바뀐다
     $("reportText").textContent = a.plainAnswer;
     const frame = $("reportFrame");
     frame.srcdoc = a.html;
@@ -195,31 +209,195 @@ function render(data) {
     setStage("chat");
     return;
   }
-  // 3안 요약: 줄 단위로 카드를 만든다 ("- 맛집형: ..." 형식)
-  const lines = a.plainAnswer.split("\n");
-  const intro = lines.filter((l) => !l.startsWith("- "));
+  // 3안 카드: plainAnswer 의 안별 블록("- 안이름: …" 아래 들여쓴 줄)을 읽어 그린다
+  const { intro, cards: parsed } = parsePlanCards(a.plainAnswer);
   if (intro.length) showNotice(intro.join("\n"), "notice");
   const cards = $("planCards");
   cards.innerHTML = "";
-  lines.filter((l) => l.startsWith("- ")).forEach((l, i) => {
-    const [name, rest] = [l.slice(2, l.indexOf(":")), l.slice(l.indexOf(":") + 1).trim()];
-    const ok = !rest.includes("미충족"); // 예산 충족 또는 예산 제한 없음이면 정상 표시
-    const card = document.createElement("button");
-    card.className = "text-left rounded-2xl border border-slate-200 bg-white p-4 shadow-sm hover:border-indigo-400 hover:shadow transition";
-    const title = document.createElement("div");
-    title.className = "font-semibold";
-    title.textContent = `${PLAN_NO[name] || i + 1}번 ${name}`;
-    const desc = document.createElement("div");
-    desc.className = "mt-2 text-xs leading-relaxed " + (ok ? "text-slate-500" : "text-rose-600");
-    desc.textContent = rest;
-    card.append(title, desc);
-    card.onclick = () => send(`${PLAN_NO[name] || i + 1}번 안으로 할게`);
-    cards.appendChild(card);
-  });
+  parsed.forEach((p, i) => cards.appendChild(buildPlanCard(p, PLAN_NO[p.name] || i + 1)));
   $("plans").classList.remove("hidden");
   setStage("select");
 }
 const PLAN_NO = { "맛집형": 1, "명소형": 2, "가성비형": 3 };
+
+// ---- plainAnswer 해석 (순수 함수: DOM 을 쓰지 않는다)
+function parsePlanCards(text) {
+  const intro = [], cards = [];
+  let cur = null;
+  for (const raw of String(text || "").split("\n")) {
+    if (raw.startsWith("- ")) {
+      const idx = raw.indexOf(":");
+      cur = { name: raw.slice(2, idx), headline: raw.slice(idx + 1).trim(), usage: "", difference: "", schedule: [] };
+      cards.push(cur);
+    } else if (cur && raw.startsWith("  ")) {
+      const line = raw.trim();
+      if (line.startsWith("예산 대비:")) cur.usage = line.slice("예산 대비:".length).trim();
+      else if (line.startsWith("차별점:")) cur.difference = line.slice("차별점:".length).trim();
+      else if (line.startsWith("· ")) cur.schedule.push(line.slice(2).trim());
+    } else if (raw.trim()) {
+      intro.push(raw);
+    }
+  }
+  cards.forEach((c) => Object.assign(c, summarizeCard(c)));
+  return { intro, cards };
+}
+
+function summarizeCard(c) {
+  const total = (c.headline.match(/합계\s*([\d,]+)원/) || [])[1] || "";
+  const target = (c.headline.match(/목표\s*([\d,]+)원/) || [])[1] || "";
+  const pctMatch = c.usage.match(/(\d+(?:\.\d+)?)%/);
+  const pct = pctMatch ? parseFloat(pctMatch[1]) : null;
+  const unlimited = c.usage.includes("예산 제한 없음") || (pct === null && c.headline.includes("예산 제한 없음"));
+  const over = c.headline.includes("미충족") || (pct !== null && pct > 100);
+  const tail = pctMatch ? c.usage.slice(c.usage.indexOf("사용") + 2).replace(/^[,\s]+/, "") : "";
+  return { total, target, pct, unlimited, over, tail };
+}
+
+function budgetTone(pct, over) {
+  if (over || (pct !== null && pct > 100)) return { text: "text-rose-600", bar: "bg-rose-500", chip: "bg-rose-50 text-rose-700", label: "예산 초과" };
+  if (pct !== null && pct > 85) return { text: "text-amber-600", bar: "bg-amber-500", chip: "bg-amber-50 text-amber-700", label: "예산 근접" };
+  return { text: "text-emerald-600", bar: "bg-emerald-500", chip: "bg-emerald-50 text-emerald-700", label: "예산 여유" };
+}
+
+function el(tag, className, text) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  if (text !== undefined) e.textContent = text; // 텍스트는 항상 textContent 로만 넣는다(이스케이프)
+  return e;
+}
+
+function buildPlanCard(p, no) {
+  const tone = budgetTone(p.pct, p.over);
+  const card = el("div", "flex flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm");
+  const head = el("div", "flex items-center justify-between");
+  const title = el("div", "flex items-center gap-2");
+  title.append(el("span", "rounded-full bg-indigo-600 px-2.5 py-0.5 text-xs font-semibold text-white", `${no}번`), el("span", "text-lg font-semibold", p.name));
+  head.append(title, el("span", `rounded-full px-2.5 py-0.5 text-xs font-medium ${p.unlimited ? "bg-slate-100 text-slate-600" : tone.chip}`, p.unlimited ? "예산 제한 없음" : tone.label));
+  card.append(head);
+
+  const money = el("div");
+  money.append(el("div", "text-xs text-slate-500", "예상 합계"), el("div", "text-3xl font-bold tabular-nums tracking-tight", p.total ? `${p.total}원` : p.headline));
+  card.append(money);
+
+  const usage = el("div", "rounded-xl bg-slate-50 p-3");
+  if (p.pct !== null) {
+    const row = el("div", "flex items-baseline justify-between");
+    row.append(el("span", `text-2xl font-bold tabular-nums ${tone.text}`, `${p.pct}%`), el("span", "text-xs text-slate-500", "예산 대비 사용"));
+    const track = el("div", "mt-2 h-3 w-full overflow-hidden rounded-full bg-slate-200");
+    const fill = el("div", `h-full rounded-full ${tone.bar}`);
+    fill.style.width = `${Math.min(p.pct, 100)}%`;
+    track.append(fill);
+    usage.append(row, track, el("div", `mt-2 text-sm font-medium ${tone.text}`, p.tail));
+    if (p.target) usage.append(el("div", "mt-0.5 text-xs text-slate-500", `목표 ${p.target}원`));
+  } else {
+    usage.append(el("div", "text-sm text-slate-500", p.unlimited ? "예산 제한 없이 만든 안입니다." : p.usage || p.headline));
+  }
+  card.append(usage);
+
+  if (p.difference) {
+    const diff = el("div");
+    diff.append(el("div", "mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500", "차별점"), el("p", "text-sm leading-relaxed text-slate-700", p.difference));
+    card.append(diff);
+  }
+  if (p.schedule.length) {
+    const sched = el("div");
+    sched.append(el("div", "mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500", "주요 일정"));
+    const list = el("ul", "space-y-1 text-sm text-slate-700");
+    p.schedule.forEach((t) => list.append(el("li", "flex gap-2", "")));
+    [...list.children].forEach((li, i) => { li.append(el("span", "text-indigo-500", "•"), el("span", "", p.schedule[i])); });
+    sched.append(list);
+    card.append(sched);
+  }
+  const pick = el("button", "mt-auto w-full rounded-xl bg-indigo-600 py-2.5 text-sm font-medium text-white hover:bg-indigo-500", "이 안으로 선택");
+  pick.dataset.pick = "1";
+  pick.onclick = async () => {
+    // 선택 즉시: 고른 카드만 활성(강조), 나머지 카드와 모든 선택 버튼은 비활성
+    const all = [...document.querySelectorAll("#planCards [data-pick]")];
+    const cards = all.map((b) => b.parentElement);
+    all.forEach((b) => { b.disabled = true; b.classList.add("cursor-not-allowed"); });
+    cards.forEach((c) => { c.classList.toggle("opacity-50", c !== card); c.classList.toggle("grayscale", c !== card); });
+    card.classList.add("border-indigo-500", "ring-2", "ring-indigo-500");
+    pick.textContent = "선택됨 ✓";
+    pick.classList.replace("bg-indigo-600", "bg-emerald-600");
+    pick.classList.remove("hover:bg-indigo-500");
+    if (await send(`${no}번 안으로 할게`)) return;
+    // 실패하면 다시 고를 수 있게 되돌린다
+    all.forEach((b) => { b.disabled = false; b.classList.remove("cursor-not-allowed"); });
+    cards.forEach((c) => c.classList.remove("opacity-50", "grayscale"));
+    card.classList.remove("border-indigo-500", "ring-2", "ring-indigo-500");
+    pick.textContent = "이 안으로 선택";
+    pick.classList.replace("bg-emerald-600", "bg-indigo-600");
+    pick.classList.add("hover:bg-indigo-500");
+  };
+  card.append(pick);
+  return card;
+}
+
+// <inline-images>
+// 리포트 HTML 안의 https 이미지를 받아 data URI 로 바꿔 넣는다(내보낸 파일을 오프라인이나 링크가 사라진 뒤에도 열 수 있게).
+// 받지 못한 이미지는 원래 주소를 그대로 두고 개수만 센다. fetchFn 을 받아 브라우저 밖에서도 검사할 수 있다.
+async function inlineImages(html, fetchFn, timeoutMs = 10000) {
+  const urls = [...new Set([...html.matchAll(/<img [^>]*?src='(https:\/\/[^']+)'/g)].map((m) => m[1]))];
+  let failed = 0;
+  const toBase64 = (buf) => {
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+  };
+  const embedded = await Promise.all(urls.map(async (escaped) => {
+    const url = escaped.replace(/&amp;/g, "&"); // 속성에 들어 있던 이스케이프를 되돌려 실제 주소로 받는다
+    const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = setTimeout(() => ctrl && ctrl.abort(), timeoutMs);
+    try {
+      const resp = await fetchFn(url, { referrerPolicy: "no-referrer", signal: ctrl && ctrl.signal });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const type = (resp.headers.get("content-type") || "").split(";")[0].trim();
+      if (!type.startsWith("image/")) throw new Error("이미지가 아닙니다");
+      return [escaped, `data:${type};base64,${toBase64(await resp.arrayBuffer())}`];
+    } catch (_) {
+      failed += 1;
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }));
+  let out = html;
+  for (const pair of embedded) if (pair) out = out.split(`src='${pair[0]}'`).join(`src='${pair[1]}'`);
+  return { html: out.replace(/ loading='lazy'/g, ""), failed, total: urls.length };
+}
+// </inline-images>
+
+// 현재 리포트를 단독으로 열 수 있는 HTML 파일로 내려받는다(탭 전환은 CSS만 쓰므로 그대로 동작한다)
+async function exportReport() {
+  if (!state.html) return;
+  const button = $("exportHtml");
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "이미지 포함하는 중…";
+  let body = state.html, failed = 0;
+  try {
+    ({ html: body, failed } = await inlineImages(state.html, (u, o) => fetch(u, o)));
+  } catch (_) { body = state.html; } // 이미지 포함에 실패해도 내보내기는 계속한다(원격 주소 그대로)
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+  const doc = '<!doctype html>\n<html lang="ko"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1"><title>여행 리포트</title></head>' +
+    '<body style="margin:0;padding:16px;background:#fff">' + body + "</body></html>";
+  const url = URL.createObjectURL(new Blob([doc], { type: "text/html;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `travel-report-${stamp}.html`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  button.disabled = false;
+  button.textContent = label;
+  if (failed) showNotice(`이미지 ${failed}개를 파일에 포함하지 못해 원본 링크로 남겼습니다. 인터넷이 연결되어 있어야 보입니다.`, "notice");
+}
+$("exportHtml").onclick = exportReport;
 
 $("send").onclick = () => send();
 $("prompt").addEventListener("keydown", (e) => {
